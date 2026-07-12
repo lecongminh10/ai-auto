@@ -1,0 +1,14 @@
+{
+  "section": {
+    "targetMatrix": { "title": "按关键词查找视频", "description": "选择平台并输入要抓取的关键词" },
+    "authMatrix": { "title": "登录设置", "description": "平台登录方式" }
+  },
+  "field": {
+    "platform": "平台", "platformPlaceholder": "选择平台",
+    "keywords": "视频关键词", "keywordsHint": "可添加多个关键词，每个关键词后按回车", "keywordsPlaceholder": "例如：AI技术、新闻、旅行...",
+    "loginMethod": "登录方式", "loginMethodPlaceholder": "选择登录方式",
+    "cookies": "Cookie", "cookiesHint": "粘贴 Cookie 字符串", "cookiesPlaceholder": "在此粘贴 Cookie..."
+  },
+  "button": { "initiateScan": "开始抓取视频", "initiating": "启动中...", "terminate": "停止", "stopping": "停止中..." },
+  "warning": { "cookieSlider": "[提示] 小红书和抖音不建议使用 Cookie 登录，可能触发滑块验证" }
+}

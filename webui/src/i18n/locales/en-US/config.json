@@ -1,0 +1,14 @@
+{
+  "section": {
+    "targetMatrix": { "title": "FIND VIDEOS BY KEYWORD", "description": "Choose a platform and enter keywords to crawl" },
+    "authMatrix": { "title": "LOGIN SETTINGS", "description": "Platform login method" }
+  },
+  "field": {
+    "platform": "PLATFORM", "platformPlaceholder": "Select platform",
+    "keywords": "VIDEO KEYWORDS", "keywordsHint": "Add multiple keywords by pressing Enter after each one", "keywordsPlaceholder": "Examples: AI technology, news, travel...",
+    "loginMethod": "LOGIN METHOD", "loginMethodPlaceholder": "Select login method",
+    "cookies": "COOKIES", "cookiesHint": "Paste cookie string", "cookiesPlaceholder": "Paste cookies here..."
+  },
+  "button": { "initiateScan": "START VIDEO CRAWL", "initiating": "STARTING...", "terminate": "STOP", "stopping": "STOPPING..." },
+  "warning": { "cookieSlider": "[Note] Cookie login is not recommended for Xiaohongshu and Douyin because it may trigger a slider captcha" }
+}

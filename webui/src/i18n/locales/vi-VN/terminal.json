@@ -1,0 +1,5 @@
+{
+  "header": { "title": "BẢNG ĐIỀU KHIỂN", "entries": "{{count}} mục", "active": "HOẠT ĐỘNG", "clear": "XÓA", "restore": "KHÔI PHỤC TOÀN BỘ NHẬT KÝ" },
+  "banner": { "systemInit": "[HỆ THỐNG] Khởi tạo thành công", "configHint": "[THÔNG TIN] Cấu hình tham số rồi bắt đầu thu thập..." },
+  "footer": { "awaiting": "đang_chờ_lệnh..." }
+}

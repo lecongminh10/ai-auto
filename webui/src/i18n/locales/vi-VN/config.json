@@ -1,0 +1,14 @@
+{
+  "section": {
+    "targetMatrix": { "title": "TÌM VIDEO THEO TỪ KHÓA", "description": "Chọn nền tảng và nhập từ khóa cần crawl" },
+    "authMatrix": { "title": "CẤU HÌNH ĐĂNG NHẬP", "description": "Phương thức đăng nhập vào nền tảng" }
+  },
+  "field": {
+    "platform": "NỀN TẢNG", "platformPlaceholder": "Chọn nền tảng",
+    "keywords": "TỪ KHÓA VIDEO", "keywordsHint": "Nhập nhiều từ khóa và phân cách bằng dấu phẩy", "keywordsPlaceholder": "Ví dụ: công nghệ AI, tin tức, du lịch",
+    "loginMethod": "PHƯƠNG THỨC ĐĂNG NHẬP", "loginMethodPlaceholder": "Chọn phương thức đăng nhập",
+    "cookies": "COOKIE", "cookiesHint": "Dán chuỗi Cookie", "cookiesPlaceholder": "Dán Cookie tại đây..."
+  },
+  "button": { "initiateScan": "BẮT ĐẦU CRAWL VIDEO", "initiating": "ĐANG KHỞI ĐỘNG...", "terminate": "DỪNG", "stopping": "ĐANG DỪNG..." },
+  "warning": { "cookieSlider": "[Lưu ý] Không nên đăng nhập Xiaohongshu và Douyin bằng Cookie vì có thể gặp captcha kéo thanh trượt" }
+}

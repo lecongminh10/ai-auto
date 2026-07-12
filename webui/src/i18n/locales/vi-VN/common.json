@@ -1,0 +1,6 @@
+{
+  "status": { "active": "ĐANG HOẠT ĐỘNG", "standby": "CHỜ", "idle": "RẢNH", "running": "ĐANG CHẠY", "stopping": "ĐANG DỪNG", "error": "LỖI" },
+  "sidebar": { "title": "MediaCrawler", "api": "API", "local": "CỤC BỘ", "disclaimer": "Chỉ dùng cho học tập cá nhân, nghiêm cấm mục đích thương mại", "license": "Giấy phép" },
+  "action": { "loading": "Đang tải...", "skip": "BỎ QUA KIỂM TRA", "retry": "KIỂM TRA LẠI" },
+  "unit": { "entries": "mục", "records": "bản ghi" }
+}
