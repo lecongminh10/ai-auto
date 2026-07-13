@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { AlertCircle, CheckCircle2, Download, ExternalLink, Eye, Heart, Languages, Loader2, MessageCircle, RefreshCw, Share2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -33,11 +34,13 @@ export function VideoResults() {
   const [dubVideo, setDubVideo] = useState<VideoItem | null>(null)
   const [transcript, setTranscript] = useState('')
   const [voice, setVoice] = useState('vi-VN-HoaiMyNeural')
+  const [mood, setMood] = useState('natural')
   const [dubOutput, setDubOutput] = useState('')
   const [dubbingOpen, setDubbingOpen] = useState(false)
   const [dubStage, setDubStage] = useState('')
   const [dubError, setDubError] = useState('')
   const [dubProgress, setDubProgress] = useState(0)
+  const [dubLogs, setDubLogs] = useState<string[]>([])
   const [filters, setFilters] = useState({ minViews: '0', minLikes: '0', minComments: '0', minShares: '0', sortBy: 'views' })
 
   const loadVideos = useCallback(async () => {
@@ -108,6 +111,7 @@ export function VideoResults() {
     setDubbing(true)
     setDubOutput('')
     setDubError('')
+    setDubLogs([])
     setDubStage('Đang tải video gốc và tách audio...')
     try {
       const response = await fetch('/api/videos/dub/prepare', {
@@ -126,6 +130,7 @@ export function VideoResults() {
         const job = await statusResponse.json()
         setDubStage(job.stage || 'Đang xử lý...')
         setDubProgress(Number(job.progress || 0))
+        setDubLogs(Array.isArray(job.logs) ? job.logs : [])
         if (job.status === 'error') throw new Error(job.error || 'Job nhận diện thất bại')
         if (job.status === 'done') {
           setDubVideo(video)
@@ -144,16 +149,31 @@ export function VideoResults() {
     if (!dubVideo || !transcript.trim()) return
     setDubbing(true)
     setDubError('')
+    setDubLogs([])
+    setDubProgress(0)
     setDubStage('Đang dịch phụ đề Trung → Việt bằng Gemini...')
     try {
       const response = await fetch('/api/videos/dub/render', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_id: dubVideo.id, transcript_srt: transcript, voice }),
+        body: JSON.stringify({ video_id: dubVideo.id, transcript_srt: transcript, voice, mood }),
       })
       const payload = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(payload.detail || 'Không thể tạo video lồng tiếng')
-      setDubOutput(`/api/videos/dub/output/${encodeURIComponent(dubVideo.id)}`)
-      setDubStage('Hoàn tất: video lồng tiếng đã sẵn sàng.')
+      for (;;) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000))
+        const statusResponse = await fetch(`/api/videos/dub/status/${payload.job_id}?t=${Date.now()}`, { cache: 'no-store' })
+        const job = await statusResponse.json().catch(() => ({}))
+        if (!statusResponse.ok) throw new Error(job.detail || `Không tìm thấy job lồng tiếng (${statusResponse.status})`)
+        setDubStage(job.stage || 'Đang lồng tiếng...')
+        setDubProgress(Number(job.progress || 0))
+        setDubLogs(Array.isArray(job.logs) ? job.logs : [])
+        if (job.status === 'error') throw new Error(job.error || 'Job lồng tiếng thất bại')
+        if (job.status === 'done') {
+          setDubOutput(job.output_url || `/api/videos/dub/output/${encodeURIComponent(dubVideo.id)}`)
+          setDubStage('Hoàn tất: video lồng tiếng đã sẵn sàng.')
+          break
+        }
+      }
     } catch (error) {
       setDubError(error instanceof Error ? error.message : 'Lồng tiếng thất bại')
       setDubStage('Pipeline dừng khi dịch/TTS/ghép video')
@@ -238,18 +258,33 @@ export function VideoResults() {
           </div>
         )}
       </div>
-      {dubbingOpen && (
-        <div className="fixed inset-x-4 bottom-4 top-20 z-[80] overflow-y-auto rounded-lg border border-cyber-neon-cyan/60 p-4 shadow-2xl space-y-3 bg-cyber-bg-tertiary">
-          <div className="flex items-center gap-2">
+      {dubbingOpen && createPortal(
+        <div className="fixed inset-0 z-[100] bg-black/60 p-4 backdrop-blur-sm">
+        <div className="mx-auto flex h-full max-w-6xl flex-col overflow-hidden rounded-lg border border-cyber-neon-cyan/60 shadow-2xl bg-cyber-bg-tertiary">
+          <div className="flex shrink-0 items-center gap-2 border-b border-cyber-border-subtle p-4">
             <Languages className="h-4 w-4 text-cyber-neon-cyan" />
             <strong className="text-xs text-cyber-text-primary">GIAO DIỆN LỒNG TIẾNG TRUNG → VIỆT {dubVideo ? `— ${dubVideo.id}` : ''}</strong>
             <button className="ml-auto text-xs text-cyber-text-muted" onClick={() => setDubbingOpen(false)}>Đóng</button>
           </div>
+          <div className="shrink-0 space-y-3 border-b border-cyber-border-subtle p-4">
           <div className="flex items-center gap-2 rounded border border-cyber-border-subtle bg-black/30 p-3 text-xs">
             {dubError ? <AlertCircle className="h-4 w-4 text-red-400" /> : dubOutput ? <CheckCircle2 className="h-4 w-4 text-green-400" /> : <Loader2 className="h-4 w-4 animate-spin text-cyber-neon-cyan" />}
             <span className={dubError ? 'text-red-300' : 'text-cyber-text-primary'}>{dubStage || 'Đang khởi tạo pipeline...'}</span>
           </div>
           {dubbing && <div className="h-1.5 overflow-hidden rounded bg-black/50"><div className="h-full rounded bg-cyber-neon-cyan transition-all duration-500" style={{ width: `${Math.max(4, dubProgress)}%` }} /></div>}
+          </div>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+          {dubLogs.length > 0 && (
+            <div className="rounded border border-cyber-border-subtle bg-black/50 p-3">
+              <div className="mb-2 flex items-center justify-between text-[11px] text-cyber-text-muted">
+                <span>NHẬT KÝ DỊCH / TTS / GHÉP VIDEO</span>
+                <span>{dubProgress}%</span>
+              </div>
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-5 text-cyber-text-primary">
+                {dubLogs.join('\n')}
+              </pre>
+            </div>
+          )}
           {dubError && <pre className="max-h-32 overflow-auto rounded border border-red-400/40 bg-red-950/20 p-3 whitespace-pre-wrap text-[11px] text-red-300">{dubError}</pre>}
           {dubVideo && <>
             <p className="text-[11px] text-cyber-text-muted">Sửa nội dung nếu Whisper nhận sai. Giữ nguyên số thứ tự và timestamp SRT.</p>
@@ -263,14 +298,40 @@ export function VideoResults() {
                   <SelectItem value="vi-VN-NamMinhNeural">Nam Minh (nam)</SelectItem>
                 </SelectContent>
               </Select>
+              <Select value={mood} onValueChange={setMood}>
+                <SelectTrigger className="h-8 w-44 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="natural">Tự nhiên, rõ lời</SelectItem>
+                  <SelectItem value="energetic">Năng lượng, vui vẻ</SelectItem>
+                  <SelectItem value="warm">Ấm áp, chậm rãi</SelectItem>
+                </SelectContent>
+              </Select>
               <Button size="sm" onClick={renderDubbing} disabled={dubbing || !transcript.trim()}>
                 <Languages className="h-4 w-4" /> {dubbing ? 'Đang dịch và ghép...' : 'Transcript đúng — tiến hành lồng tiếng'}
               </Button>
               {dubOutput && <a href={dubOutput} className="text-xs text-cyber-neon-cyan underline">Tải output_vi.mp4</a>}
+              {(dubbing || dubError) && (
+                <div className={`w-full rounded border p-3 ${dubError ? 'border-red-400/50 bg-red-950/20' : 'border-cyber-neon-cyan/50 bg-black/40'}`} aria-live="polite">
+                  <div className="mb-2 flex items-center gap-2 text-xs">
+                    {dubError ? <AlertCircle className="h-4 w-4 shrink-0 text-red-400" /> : <Loader2 className="h-4 w-4 shrink-0 animate-spin text-cyber-neon-cyan" />}
+                    <span className={dubError ? 'text-red-300' : 'text-cyber-text-primary'}>{dubError || dubStage}</span>
+                    <strong className="ml-auto text-cyber-neon-cyan">{dubProgress}%</strong>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded bg-black/60">
+                    <div
+                      className={`h-full rounded transition-all duration-500 ${dubError ? 'bg-red-400' : 'bg-cyber-neon-cyan'}`}
+                      style={{ width: `${Math.max(dubError ? 100 : 3, dubProgress)}%` }}
+                    />
+                  </div>
+                  {dubLogs.length > 0 && <p className="mt-2 truncate font-mono text-[10px] text-cyber-text-muted">{dubLogs[dubLogs.length - 1]}</p>}
+                </div>
+              )}
             </div>
           </>}
+          </div>
         </div>
-      )}
+        </div>
+      , document.body)}
     </section>
   )
 }

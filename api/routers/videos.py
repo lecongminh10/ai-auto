@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -20,6 +21,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 VIDEO_DIR = PROJECT_ROOT / "video"
 _DUB_JOBS: dict[str, dict] = {}
+
+
+def _append_job_log(job: dict, message: str) -> None:
+    logs = job.setdefault("logs", [])
+    entry = f"{time.strftime('%H:%M:%S')} — {message}"
+    if not logs or logs[-1] != entry:
+        logs.append(entry)
+        del logs[:-100]
 
 
 def _number(value) -> int:
@@ -183,6 +192,7 @@ class DubbingRenderRequest(BaseModel):
     video_id: str
     transcript_srt: str
     voice: Literal["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"] = "vi-VN-HoaiMyNeural"
+    mood: Literal["natural", "energetic", "warm"] = "natural"
 
 
 @router.post("/translate-keywords")
@@ -262,7 +272,7 @@ async def prepare_dubbing(request: DubbingPrepareRequest):
     if request.platform != "dy":
         raise HTTPException(400, "Hiện pipeline lồng tiếng chỉ hỗ trợ video Douyin")
     job_id = uuid.uuid4().hex
-    _DUB_JOBS[job_id] = {"job_id": job_id, "video_id": request.video_id, "status": "running", "stage": "Đang chuẩn bị...", "progress": 0, "transcript_srt": "", "error": ""}
+    _DUB_JOBS[job_id] = {"job_id": job_id, "video_id": request.video_id, "status": "running", "stage": "Đang chuẩn bị...", "progress": 0, "transcript_srt": "", "error": "", "logs": []}
     asyncio.create_task(_prepare_dubbing_job(job_id, request))
     return {"job_id": job_id, "video_id": request.video_id}
 
@@ -270,16 +280,77 @@ async def prepare_dubbing(request: DubbingPrepareRequest):
 async def _prepare_dubbing_job(job_id: str, request: DubbingPrepareRequest):
     job = _DUB_JOBS[job_id]
     try:
-        job.update(stage="Đang tải video gốc...", progress=15)
-        await download_video(request)
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", request.video_id)
         work_dir = VIDEO_DIR / "dy" / safe_id
+        await _download_dubbing_video(request, work_dir, job)
         job.update(stage="Đã tải xong. Đang tách audio WAV 16 kHz...", progress=30)
         job.update(stage="Đang chạy Whisper model small nhận diện tiếng Trung (lần đầu có thể tải model)...", progress=40)
-        transcript = await transcribe(work_dir / "video.mp4", work_dir)
+        async def whisper_progress(done: int, total: int):
+            job.update(stage=f"Whisper đang xử lý đoạn {done}/{total} (tối đa 3 đoạn song song)...", progress=40 + int(done / total * 55))
+        transcript = await transcribe(work_dir / "video.mp4", work_dir, whisper_progress)
         job.update(status="done", stage="Đã nhận diện xong transcript.", progress=100, transcript_srt=transcript)
     except (RuntimeError, ValueError, OSError) as exc:
         job.update(status="error", stage="Pipeline dừng do lỗi.", error=str(exc))
+
+
+async def _download_dubbing_video(request: DubbingPrepareRequest, work_dir: Path, job: dict):
+    parsed = urlparse(request.url)
+    if parsed.scheme not in {"http", "https"} or not (parsed.hostname and parsed.hostname.endswith("douyin.com")):
+        raise ValueError("URL video Douyin không hợp lệ hoặc đã hết hạn")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    target = work_dir / "video.mp4"
+    downloaded = target.stat().st_size if target.exists() else 0
+    total = 0
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30, read=60)) as client:
+        for attempt in range(6):
+            try:
+                headers = {"User-Agent": "Mozilla/5.0"}
+                if downloaded:
+                    headers["Range"] = f"bytes={downloaded}-"
+                async with client.stream("GET", request.url, headers=headers) as response:
+                    response.raise_for_status()
+                    if downloaded and response.status_code != 206:
+                        # CDN không hỗ trợ resume trong lượt này; bắt đầu lại an toàn.
+                        downloaded = 0
+                        target.unlink(missing_ok=True)
+                    content_range = response.headers.get("content-range", "")
+                    if "/" in content_range:
+                        total = int(content_range.rsplit("/", 1)[1])
+                    elif response.headers.get("content-length"):
+                        total = downloaded + int(response.headers["content-length"])
+                    mode = "ab" if downloaded and response.status_code == 206 else "wb"
+                    with target.open(mode) as output:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            output.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                percent = min(25, 5 + int(downloaded / total * 20))
+                                stage = f"Đang tải video gốc... {downloaded / 1048576:.1f}/{total / 1048576:.1f} MB"
+                            else:
+                                percent = 10
+                                stage = f"Đang tải video gốc... {downloaded / 1048576:.1f} MB"
+                            job.update(stage=stage, progress=percent)
+                if total and downloaded < total:
+                    raise RuntimeError(f"CDN ngắt ở {downloaded}/{total} byte")
+                return
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 416 and downloaded:
+                    # Phần tạm không khớp URL CDN hiện tại (đã đủ hoặc khác
+                    # phiên bản). Xóa một lần rồi tải lại từ đầu.
+                    downloaded = 0
+                    total = 0
+                    target.unlink(missing_ok=True)
+                    job.update(stage="URL CDN đã thay đổi, bắt đầu tải lại từ đầu...", progress=5)
+                    continue
+                last_error = exc
+                job.update(stage=f"Mạng/CDN lỗi, đang tải tiếp (lần {attempt + 1}/6)...", progress=min(24, 5 + attempt * 3))
+                await asyncio.sleep(min(2 ** attempt, 10))
+            except (httpx.HTTPError, OSError, RuntimeError) as exc:
+                last_error = exc
+                job.update(stage=f"Mạng gián đoạn, đang tải tiếp (lần {attempt + 1}/6)...", progress=min(24, 5 + attempt * 3))
+                await asyncio.sleep(min(2 ** attempt, 10))
+    raise RuntimeError(f"Tải video thất bại sau khi thử tiếp 6 lần: {last_error}")
 
 
 @router.get("/dub/status/{job_id}")
@@ -292,17 +363,73 @@ async def dubbing_job_status(job_id: str):
 
 @router.post("/dub/render")
 async def render_dubbing(request: DubbingRenderRequest):
-    """Dịch transcript đã duyệt, tạo TTS, khớp timeline và ghép video."""
+    """Tạo job nền để request không timeout với video dài."""
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", request.video_id)
     work_dir = VIDEO_DIR / "dy" / safe_id
     video_path = work_dir / "video.mp4"
     if not video_path.exists():
         raise HTTPException(404, "Chưa có video gốc; hãy chạy bước tạo transcript trước")
+    job_id = uuid.uuid4().hex
+    _DUB_JOBS[job_id] = {
+        "job_id": job_id,
+        "video_id": request.video_id,
+        "status": "running",
+        "stage": "Đang chuẩn bị dịch phụ đề...",
+        "progress": 0,
+        "transcript_srt": "",
+        "error": "",
+        "output_url": "",
+        "logs": [],
+    }
+    asyncio.create_task(_render_dubbing_job(job_id, request, video_path, work_dir))
+    return {"job_id": job_id, "video_id": request.video_id}
+
+
+async def _render_dubbing_job(
+    job_id: str, request: DubbingRenderRequest, video_path: Path, work_dir: Path
+):
+    job = _DUB_JOBS[job_id]
+
+    async def progress(stage: str, done: int, total: int):
+        total = max(total, 1)
+        if stage == "translate":
+            message = f"Đang dịch phụ đề: nhóm {done}/{total}..."
+            job.update(
+                stage=message,
+                progress=min(25, int(done / total * 25)),
+            )
+            _append_job_log(job, message)
+        elif stage == "tts":
+            message = f"Đang tạo giọng đọc: câu {done}/{total}..."
+            job.update(
+                stage=message,
+                progress=25 + int(done / total * 65),
+            )
+            _append_job_log(job, message)
+        elif stage == "mux":
+            message = "Đang ghép âm thanh vào video..." if not done else "Đã ghép video xong."
+            job.update(
+                stage=message,
+                progress=92 if not done else 100,
+            )
+            _append_job_log(job, message)
+        else:
+            job.update(stage=stage)
+            _append_job_log(job, stage)
+
     try:
-        output = await dub(video_path, work_dir, request.transcript_srt, request.voice)
-        return {"success": True, "path": str(output.relative_to(PROJECT_ROOT))}
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(500, str(exc)) from exc
+        await dub(
+            video_path, work_dir, request.transcript_srt, request.voice, request.mood, progress
+        )
+        job.update(
+            status="done",
+            stage="Hoàn tất: video lồng tiếng đã sẵn sàng.",
+            progress=100,
+            output_url=f"/api/videos/dub/output/{request.video_id}",
+        )
+    except (RuntimeError, ValueError, OSError) as exc:
+        _append_job_log(job, f"LỖI: {exc}")
+        job.update(status="error", stage="Pipeline lồng tiếng dừng do lỗi.", error=str(exc))
 
 
 @router.get("/dub/output/{video_id}")
@@ -311,4 +438,6 @@ async def get_dubbed_video(video_id: str):
     output = VIDEO_DIR / "dy" / safe_id / "output_vi.mp4"
     if not output.exists():
         raise HTTPException(404, "Video lồng tiếng chưa được tạo")
+    # Không dọn file trung gian tại đây: trình duyệt có thể mở link output cũ
+    # trong khi một job retry đang dùng các file TTS/cache cùng thư mục.
     return FileResponse(output, media_type="video/mp4", filename=f"{safe_id}_vi.mp4")

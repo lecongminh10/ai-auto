@@ -14,7 +14,7 @@ Terminal 1 — chạy backend (cổng `8080`):
 
 ```bash
 cd /Users/lecongminh/code/job/auto-ai/MediaCrawler
-uv run uvicorn api.main:app --port 8080 --reload
+uv run uvicorn api.main:app --port 8080
 ```
 
 Terminal 2 — chạy frontend (cổng `5173`):
@@ -72,7 +72,7 @@ cp .env.example .env
 
 Điền `GEMINI_API_KEYS` trong `.env` nếu dùng tính năng Gemini. Không commit hoặc gửi file `.env` cho người khác.
 
-Whisper mặc định dùng model `small` để chạy ổn định trên Mac. Có thể chọn model khác trong `.env` (`tiny`, `base`, `small`, `medium`, `large-v3`); model càng lớn càng chính xác nhưng chạy lâu hơn và cần tải nhiều dữ liệu lần đầu.
+Whisper mặc định dùng model `small` để chạy ổn định trên Mac, chia audio 60 giây và chạy 3 đoạn song song. Có thể điều chỉnh trong `.env` bằng `WHISPER_CHUNK_SECONDS` và `WHISPER_PARALLELISM`; chia dưới 30 giây thường không nhanh hơn vì mỗi đoạn phải nạp model.
 
 ## Chạy crawler bằng dòng lệnh (không dùng WebUI)
 
@@ -99,7 +99,13 @@ Dữ liệu mặc định được lưu trong thư mục `data/`; video tải v�
 5. Chọn giọng Hoài My hoặc Nam Minh, rồi nhấn **Transcript đúng — tiến hành lồng tiếng**.
 6. Khi hoàn tất, nhấn **Tải output_vi.mp4**.
 
-File đầu ra và toàn bộ file trung gian được giữ tại `video/dy/<video_id>/`.
+Hệ thống tự chia video dài thành chapter nội bộ để phân phối TTS song song:
+video 10–30 phút dùng chapter 5 phút và tối đa 6 tác vụ; video trên 30 phút
+dùng chapter 4 phút và tối đa 8 tác vụ. Có thể ghi đè bằng
+`TTS_PARALLELISM` trong `.env`. Gemini vẫn chạy tuần tự để tránh quota 429.
+
+Khi hoàn tất, thư mục `video/dy/<video_id>/` chỉ giữ `output_vi.mp4`; toàn bộ
+chapter, audio, transcript và cache trung gian được tự động xóa.
 
 ## Chạy bản frontend đã build
 
