@@ -72,7 +72,16 @@ async def serve_frontend():
     """Return frontend page"""
     index_path = os.path.join(WEBUI_DIR, "index.html")
     if os.path.exists(index_path):
-        return FileResponse(index_path)
+        # index.html trỏ tới bundle có hash. Không cache HTML để sau mỗi lần
+        # deploy trình duyệt luôn nhận đúng tên bundle mới thay vì tiếp tục
+        # chạy JavaScript cũ và báo lỗi dù API hiện tại vẫn hoạt động.
+        return FileResponse(
+            index_path,
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
     return {
         "message": "Video Crawler API",
         "version": "1.0.0",

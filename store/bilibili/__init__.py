@@ -68,6 +68,7 @@ async def update_bilibili_video(video_item: Dict):
         "liked_count": str(video_item_stat.get("like", "")),
         "disliked_count": str(video_item_stat.get("dislike", "")),
         "video_play_count": str(video_item_stat.get("view", "")),
+        "duration_seconds": int(video_item_view.get("duration") or 0),
         "video_favorite_count": str(video_item_stat.get("favorite", "")),
         "video_share_count": str(video_item_stat.get("share", "")),
         "video_coin_count": str(video_item_stat.get("coin", "")),

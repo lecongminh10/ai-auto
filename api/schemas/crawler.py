@@ -76,6 +76,7 @@ class CrawlerStartRequest(BaseModel):
     headless: bool = False
     max_notes_count: Optional[int] = Field(default=None, ge=1, le=MAX_API_LIMIT_COUNT)
     max_comments_count: Optional[int] = Field(default=None, ge=1, le=MAX_API_LIMIT_COUNT)
+    min_video_duration_seconds: int = Field(default=0, ge=0, le=24 * 60 * 60)
 
 
 class CrawlerStatusResponse(BaseModel):

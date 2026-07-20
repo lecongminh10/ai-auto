@@ -13,18 +13,22 @@ async def test_cmd_arg_crawler_max_notes_count():
     # Store original values
     orig_notes = config.CRAWLER_MAX_NOTES_COUNT
     orig_comments = config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES
+    orig_duration = config.MIN_VIDEO_DURATION_SECONDS
 
     try:
         await parse_cmd([
             "--platform", "xhs",
             "--crawler_max_notes_count", "42",
-            "--max_comments_count_singlenotes", "24"
+            "--max_comments_count_singlenotes", "24",
+            "--min_video_duration_seconds", "600",
         ])
         assert config.CRAWLER_MAX_NOTES_COUNT == 42
         assert config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES == 24
+        assert config.MIN_VIDEO_DURATION_SECONDS == 600
     finally:
         config.CRAWLER_MAX_NOTES_COUNT = orig_notes
         config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = orig_comments
+        config.MIN_VIDEO_DURATION_SECONDS = orig_duration
 
 def test_crawler_manager_build_command():
     cm = CrawlerManager()
@@ -42,6 +46,7 @@ def test_crawler_manager_build_command():
     # Check that the custom arguments are NOT present
     assert "--crawler_max_notes_count" not in cmd1
     assert "--max_comments_count_singlenotes" not in cmd1
+    assert "--min_video_duration_seconds" not in cmd1
 
     # 2. Both limits passed in API request
     req2 = CrawlerStartRequest(
@@ -50,7 +55,8 @@ def test_crawler_manager_build_command():
         crawler_type=CrawlerTypeEnum.SEARCH,
         keywords="test",
         max_notes_count=50,
-        max_comments_count=5
+        max_comments_count=5,
+        min_video_duration_seconds=900,
     )
     cmd2 = cm._build_command(req2)
     # Check that they are correctly added
@@ -61,6 +67,8 @@ def test_crawler_manager_build_command():
     assert "--max_comments_count_singlenotes" in cmd2
     idx_comments = cmd2.index("--max_comments_count_singlenotes")
     assert cmd2[idx_comments + 1] == "5"
+    idx_duration = cmd2.index("--min_video_duration_seconds")
+    assert cmd2[idx_duration + 1] == "900"
 
 def test_api_start_crawler_with_limits():
     client = TestClient(app)

@@ -89,8 +89,9 @@ class DouYinLogin(AbstractLogin):
             utils.logger.info("[DouYinLogin.begin] login failed please confirm ...")
             sys.exit()
 
-        (Path.cwd() / "browser_data" / "douyin_login_qr.png").unlink(missing_ok=True)
-        (Path.cwd() / "browser_data" / "douyin_authenticated").touch()
+        workspace_root = Path(config.WORKSPACE_ROOT)
+        (workspace_root / "browser_data" / "douyin_login_qr.png").unlink(missing_ok=True)
+        (workspace_root / "browser_data" / "douyin_authenticated").touch()
 
         # wait for redirect
         wait_redirect_seconds = 5
@@ -145,23 +146,70 @@ class DouYinLogin(AbstractLogin):
 
     async def login_by_qrcode(self):
         utils.logger.info("[DouYinLogin.login_by_qrcode] Begin login douyin by qrcode...")
-        candidates = (
-            "#animate_qrcode_container img, "
-            "#login-panel-new img[src*='qr'], "
-            "img[src*='qrcode'], img[alt*='二维码'], canvas"
+        panel = self.context_page.locator("#login-panel-new")
+        # Douyin đôi lúc mở mặc định tab đăng nhập số điện thoại. Chuyển sang
+        # tab quét mã trước khi tìm QR, nhưng không phụ thuộc duy nhất vào text.
+        for label in ("扫码登录", "二维码登录", "扫码"):
+            try:
+                tab = panel.get_by_text(label, exact=False).first
+                if await tab.is_visible():
+                    await tab.click()
+                    await asyncio.sleep(0.5)
+                    break
+            except Exception:
+                continue
+
+        selectors = (
+            "#animate_qrcode_container",
+            "#login-panel-new [class*='qrcode' i]",
+            "#login-panel-new [class*='qr-code' i]",
+            "#login-panel-new img[src*='qrcode' i]",
+            "#login-panel-new img[src*='qr' i]",
+            "#login-panel-new img[alt*='二维码']",
+            "#login-panel-new canvas",
         )
         base64_qrcode_img = ""
-        try:
-            qr_element = self.context_page.locator(candidates).first
-            await qr_element.wait_for(state="visible", timeout=30000)
-            screenshot = await qr_element.screenshot(type="png")
-            base64_qrcode_img = base64.b64encode(screenshot).decode("utf-8")
-        except Exception as exc:
-            utils.logger.error(f"[DouYinLogin.login_by_qrcode] QR element not found: {exc}")
+        deadline = asyncio.get_running_loop().time() + 30
+        while not base64_qrcode_img and asyncio.get_running_loop().time() < deadline:
+            for selector in selectors:
+                elements = self.context_page.locator(selector)
+                try:
+                    count = await elements.count()
+                except Exception:
+                    continue
+                for index in range(count):
+                    element = elements.nth(index)
+                    try:
+                        if not await element.is_visible():
+                            continue
+                        box = await element.bounding_box()
+                        if not box or box["width"] < 100 or box["height"] < 100:
+                            continue
+                        screenshot = await element.screenshot(type="png")
+                        if len(screenshot) < 1_000:
+                            continue
+                        base64_qrcode_img = base64.b64encode(screenshot).decode("utf-8")
+                        break
+                    except Exception:
+                        continue
+                if base64_qrcode_img:
+                    break
+            if not base64_qrcode_img:
+                await asyncio.sleep(0.5)
+
         if not base64_qrcode_img:
+            debug_path = Path(config.WORKSPACE_ROOT) / "browser_data" / "douyin_login_debug.png"
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                await self.context_page.screenshot(path=str(debug_path), full_page=True)
+                utils.logger.error(
+                    f"[DouYinLogin.login_by_qrcode] Không tìm thấy QR; ảnh chẩn đoán: {debug_path}"
+                )
+            except Exception as exc:
+                utils.logger.error(f"[DouYinLogin.login_by_qrcode] Không chụp được ảnh chẩn đoán: {exc}")
             raise RuntimeError("Không tìm thấy QR đăng nhập Douyin")
 
-        qr_path = Path.cwd() / "browser_data" / "douyin_login_qr.png"
+        qr_path = Path(config.WORKSPACE_ROOT) / "browser_data" / "douyin_login_qr.png"
         qr_path.parent.mkdir(parents=True, exist_ok=True)
         qr_path.write_bytes(base64.b64decode(base64_qrcode_img))
         utils.logger.info("[DouYinLogin.login_by_qrcode] QR đã sẵn sàng trên WebUI, vui lòng quét trong 60 giây")

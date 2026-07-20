@@ -28,6 +28,28 @@ Sau đó mở: <http://localhost:5173>
 
 Với Douyin, lần chạy đầu tiên WebUI sẽ hiện QR ngay trên trang để quét bằng ứng dụng Douyin. Phiên đăng nhập được lưu trong `browser_data/dy_user_data_dir`; các lần sau crawler chạy ẩn và không mở website Douyin. Chỉ cần quét lại khi Douyin làm phiên đăng nhập hết hạn.
 
+## Cho nhiều người dùng cùng lúc
+
+Build frontend và chạy một server lắng nghe trong mạng LAN:
+
+```bash
+cd /Users/lecongminh/code/job/auto-ai/MediaCrawler/webui
+npm run build
+
+cd ..
+uv run uvicorn api.main:app --host 0.0.0.0 --port 8080
+```
+
+Người dùng cùng mạng mở `http://<IP-của-máy-chạy-server>:8080`. Mỗi trình duyệt
+được cấp một workspace ngẫu nhiên và chỉ thấy tiến trình, log, QR đăng nhập,
+kết quả crawl, video tải về và job lồng tiếng của workspace đó. Dữ liệu nằm tại
+`workspaces/<workspace_id>/{data,video,browser_data}`. Xóa localStorage của trang
+sẽ tạo workspace mới và không còn thấy workspace cũ.
+
+Workspace ID là mã truy cập ngẫu nhiên, phù hợp cho nhóm tin cậy trong LAN nhưng
+không thay thế tài khoản/mật khẩu. Nếu mở ra Internet, cần đặt server sau HTTPS
+và lớp đăng nhập/reverse proxy; không công khai trực tiếp cổng `8080`.
+
 Để dừng, nhấn `Ctrl+C` ở cả hai Terminal.
 
 ## Cài đặt lần đầu hoặc sau khi cập nhật code
@@ -93,6 +115,8 @@ Dữ liệu mặc định được lưu trong thư mục `data/`; video tải v�
 ### Lồng tiếng một video Douyin sang tiếng Việt
 
 1. Crawl Douyin và đợi danh sách video xuất hiện.
+   Mặc định WebUI giữ mọi thời lượng. Có thể đặt ngưỡng tại ô
+   **Video dài hơn (phút)** trước khi bắt đầu crawl nếu chỉ cần video dài.
 2. Tích chọn **đúng một video**.
 3. Nhấn **Lồng tiếng Việt**.
 4. Đợi Whisper tạo transcript, sau đó đọc và sửa nội dung tiếng Trung trong ô SRT. Giữ nguyên số thứ tự và timestamp.
@@ -100,12 +124,29 @@ Dữ liệu mặc định được lưu trong thư mục `data/`; video tải v�
 6. Khi hoàn tất, nhấn **Tải output_vi.mp4**.
 
 Hệ thống tự chia video dài thành chapter nội bộ để phân phối TTS song song:
-video 10–30 phút dùng chapter 5 phút và tối đa 6 tác vụ; video trên 30 phút
-dùng chapter 4 phút và tối đa 8 tác vụ. Có thể ghi đè bằng
-`TTS_PARALLELISM` trong `.env`. Gemini vẫn chạy tuần tự để tránh quota 429.
+video 10–30 phút dùng chapter 5 phút và tối đa 4 tác vụ; video trên 30 phút
+dùng chapter 4 phút và tối đa 4 tác vụ để hạn chế Edge-TTS trả audio rỗng. Có thể ghi đè bằng
+`TTS_PARALLELISM` trong `.env`. Khi nhiều người chạy đồng thời, toàn server còn
+được chặn bởi `TTS_GLOBAL_PARALLELISM` (mặc định 4),
+`WHISPER_GLOBAL_PARALLELISM` (mặc định 3) và
+`TRANSLATION_GLOBAL_PARALLELISM` (mặc định 1). Vì vậy job có thể hiện trạng thái
+chờ lượt thay vì cùng dội request vào Gemini/Google/Edge-TTS và bị rate-limit.
 
 Khi hoàn tất, thư mục `video/dy/<video_id>/` chỉ giữ `output_vi.mp4`; toàn bộ
 chapter, audio, transcript và cache trung gian được tự động xóa.
+
+### Gửi video sang MediaSocial
+
+Chạy MediaSocial trước trên cổng `8090`, sau đó cấu hình trong `.env`:
+
+```env
+MEDIA_SOCIAL_URL=http://127.0.0.1:8090
+MEDIASOCIAL_INTAKE_KEY=thay-bang-mot-khoa-bi-mat
+```
+
+Đặt cùng `MEDIASOCIAL_INTAKE_KEY` trong `MediaSocial/.env`. MediaCrawler chỉ gửi
+`output_vi.mp4` sau khi quá trình lồng tiếng hoàn tất. Nếu MediaSocial chưa chạy
+lúc đó, tích chọn video đã lồng tiếng và nhấn **Gửi MediaSocial** để gửi lại.
 
 ## Chạy bản frontend đã build
 

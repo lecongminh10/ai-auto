@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useCrawlerStore } from '@/store/crawlerStore'
 import type { LogEntry } from '@/types/crawler'
+import { workspaceId } from '@/lib/workspace'
 
 // 模块级单例，确保全局只有一个 WebSocket 连接
 let globalWs: WebSocket | null = null
@@ -32,7 +33,7 @@ export function useLogWebSocket() {
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const host = window.location.host
-      const wsUrl = `${protocol}//${host}/api/ws/logs`
+      const wsUrl = `${protocol}//${host}/api/ws/logs?workspace_id=${encodeURIComponent(workspaceId)}`
 
       const ws = new WebSocket(wsUrl)
       globalWs = ws

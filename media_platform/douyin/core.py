@@ -162,15 +162,26 @@ class DouYinCrawler(AbstractCrawler):
                     break
                 dy_search_id = posts_res.get("extra", {}).get("logid", "")
                 page_aweme_list = []
+                skipped_short_count = 0
                 for post_item in posts_res.get("data"):
                     try:
                         aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
                     except TypeError:
                         continue
+                    duration_ms = int((aweme_info.get("video") or {}).get("duration") or 0)
+                    min_duration_ms = config.MIN_VIDEO_DURATION_SECONDS * 1000
+                    if min_duration_ms and duration_ms <= min_duration_ms:
+                        skipped_short_count += 1
+                        continue
                     aweme_list.append(aweme_info.get("aweme_id", ""))
                     page_aweme_list.append(aweme_info.get("aweme_id", ""))
                     await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     await self.get_aweme_media(aweme_item=aweme_info)
+                if skipped_short_count:
+                    utils.logger.info(
+                        f"[DouYinCrawler.search] Skipped {skipped_short_count} videos not longer than "
+                        f"{config.MIN_VIDEO_DURATION_SECONDS // 60} minutes"
+                    )
                 
                 # Batch get note comments for the current page
                 await self.batch_get_note_comments(page_aweme_list)
@@ -337,7 +348,7 @@ class DouYinCrawler(AbstractCrawler):
     ) -> BrowserContext:
         """Launch browser and create browser context"""
         if config.SAVE_LOGIN_STATE:
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
+            user_data_dir = os.path.join(config.WORKSPACE_ROOT, "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
             launch_args = ["--window-position=-10000,-10000", "--window-size=800,600"] if config.PLATFORM == "dy" and not headless else None
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,

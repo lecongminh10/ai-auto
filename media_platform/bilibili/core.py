@@ -225,7 +225,15 @@ class BilibiliCrawler(AbstractCrawler):
                 video_items = await asyncio.gather(*task_list)
                 for video_item in video_items:
                     if video_item:
-                        video_id_list.append(video_item.get("View").get("aid"))
+                        video_view = video_item.get("View") or {}
+                        duration_seconds = int(video_view.get("duration") or 0)
+                        if config.MIN_VIDEO_DURATION_SECONDS and duration_seconds <= config.MIN_VIDEO_DURATION_SECONDS:
+                            utils.logger.info(
+                                f"[BilibiliCrawler.search_by_keywords] Skip video {video_view.get('aid')} "
+                                f"({duration_seconds}s; requires > {config.MIN_VIDEO_DURATION_SECONDS}s)"
+                            )
+                            continue
+                        video_id_list.append(video_view.get("aid"))
                         await bilibili_store.update_bilibili_video(video_item)
                         await bilibili_store.update_up_info(video_item)
                         await self.get_bilibili_video(video_item, semaphore)
@@ -297,6 +305,10 @@ class BilibiliCrawler(AbstractCrawler):
 
                         for video_item in video_items:
                             if video_item:
+                                video_view = video_item.get("View") or {}
+                                duration_seconds = int(video_view.get("duration") or 0)
+                                if config.MIN_VIDEO_DURATION_SECONDS and duration_seconds <= config.MIN_VIDEO_DURATION_SECONDS:
+                                    continue
                                 if (daily_limit and total_notes_crawled_for_keyword >= config.CRAWLER_MAX_NOTES_COUNT):
                                     break
                                 if (not daily_limit and total_notes_crawled_for_keyword >= config.CRAWLER_MAX_NOTES_COUNT):
@@ -305,7 +317,7 @@ class BilibiliCrawler(AbstractCrawler):
                                     break
                                 notes_count_this_day += 1
                                 total_notes_crawled_for_keyword += 1
-                                video_id_list.append(video_item.get("View").get("aid"))
+                                video_id_list.append(video_view.get("aid"))
                                 await bilibili_store.update_bilibili_video(video_item)
                                 await bilibili_store.update_up_info(video_item)
                                 await self.get_bilibili_video(video_item, semaphore)
@@ -504,7 +516,7 @@ class BilibiliCrawler(AbstractCrawler):
         if config.SAVE_LOGIN_STATE:
             # feat issue #14
             # we will save login state to avoid login every time
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
+            user_data_dir = os.path.join(config.WORKSPACE_ROOT, "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
             browser_context = await chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
                 accept_downloads=True,

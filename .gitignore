@@ -166,6 +166,7 @@ cython_debug/
 /browser_data/
 /data/
 /video/
+/workspaces/
 
 */.DS_Store
 .vscode

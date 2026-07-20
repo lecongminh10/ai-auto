@@ -20,6 +20,7 @@ import asyncio
 import subprocess
 import signal
 import os
+import sys
 from typing import Optional, List
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from ..schemas import CrawlerStartRequest, LogEntry
 class CrawlerManager:
     """Crawler process manager"""
 
-    def __init__(self):
+    def __init__(self, workspace_id: str = "default", workspace_root: Path | None = None):
         self._lock = asyncio.Lock()
         self.process: Optional[subprocess.Popen] = None
         self.status = "idle"
@@ -41,6 +42,9 @@ class CrawlerManager:
         self._read_task: Optional[asyncio.Task] = None
         # Project root directory
         self._project_root = Path(__file__).parent.parent.parent
+        self.workspace_id = workspace_id
+        self._workspace_root = workspace_root or self._project_root
+        self._workspace_root.mkdir(parents=True, exist_ok=True)
         # Log queue - for pushing to WebSocket
         self._log_queue: Optional[asyncio.Queue] = None
 
@@ -116,7 +120,7 @@ class CrawlerManager:
                 "dy": "douyin",
                 "bili": "bilibili",
             }.get(config.platform.value, config.platform.value)
-            data_dir = self._project_root / "data" / platform_dir
+            data_dir = self._workspace_root / "data" / platform_dir
             if data_dir.exists():
                 for result_file in data_dir.rglob("search_contents_*"):
                     if result_file.is_file() and result_file.suffix in {".json", ".jsonl", ".csv", ".xlsx"}:
@@ -126,7 +130,7 @@ class CrawlerManager:
             cmd = self._build_command(config)
 
             # Xóa QR cũ để WebUI không hiển thị một mã đã hết hạn.
-            (self._project_root / "browser_data" / "douyin_login_qr.png").unlink(missing_ok=True)
+            (self._workspace_root / "browser_data" / "douyin_login_qr.png").unlink(missing_ok=True)
 
             # Log start information
             entry = self._create_log_entry(f"Starting crawler: {' '.join(cmd)}", "info")
@@ -142,7 +146,11 @@ class CrawlerManager:
                     encoding='utf-8',
                     bufsize=1,
                     cwd=str(self._project_root),
-                    env={**os.environ, "PYTHONUNBUFFERED": "1"}
+                    env={
+                        **os.environ,
+                        "PYTHONUNBUFFERED": "1",
+                        "MEDIACRAWLER_WORKSPACE_ROOT": str(self._workspace_root),
+                    }
                 )
 
                 self.status = "running"
@@ -219,12 +227,13 @@ class CrawlerManager:
 
     def _build_command(self, config: CrawlerStartRequest) -> list:
         """Build main.py command line arguments"""
-        cmd = ["uv", "run", "python", "main.py"]
+        cmd = [sys.executable, str(self._project_root / "main.py")]
 
         cmd.extend(["--platform", config.platform.value])
         cmd.extend(["--lt", config.login_type.value])
         cmd.extend(["--type", config.crawler_type.value])
         cmd.extend(["--save_data_option", config.save_option.value])
+        cmd.extend(["--save_data_path", str(self._workspace_root / "data")])
 
         # Pass different arguments based on crawler type
         if config.crawler_type.value == "search" and config.keywords:
@@ -246,12 +255,15 @@ class CrawlerManager:
         if config.max_comments_count is not None:
             cmd.extend(["--max_comments_count_singlenotes", str(config.max_comments_count)])
 
+        if config.crawler_type.value == "search" and config.min_video_duration_seconds:
+            cmd.extend(["--min_video_duration_seconds", str(config.min_video_duration_seconds)])
+
         if config.cookies:
             cmd.extend(["--cookies", config.cookies])
 
         # Douyin chặn Chromium headless ở lần đăng nhập đầu. Khi chưa có phiên,
         # mở Chromium ngoài vùng nhìn thấy để lấy QR về WebUI; sau đó luôn headless.
-        authenticated = (self._project_root / "browser_data" / "douyin_authenticated").exists()
+        authenticated = (self._workspace_root / "browser_data" / "douyin_authenticated").exists()
         headless = authenticated if config.platform.value == "dy" else config.headless
         cmd.extend(["--headless", "true" if headless else "false"])
 
@@ -305,3 +317,17 @@ class CrawlerManager:
 
 # Global singleton
 crawler_manager = CrawlerManager()
+
+_crawler_managers: dict[str, CrawlerManager] = {"default": crawler_manager}
+
+
+def get_crawler_manager(workspace_id: str) -> CrawlerManager:
+    """Return an isolated crawler process/log/profile manager per browser workspace."""
+    if workspace_id not in _crawler_managers:
+        from ..workspace import workspace_root
+
+        _crawler_managers[workspace_id] = CrawlerManager(
+            workspace_id=workspace_id,
+            workspace_root=workspace_root(workspace_id),
+        )
+    return _crawler_managers[workspace_id]

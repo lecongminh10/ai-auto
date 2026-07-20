@@ -9,6 +9,7 @@ export interface CrawlerConfig {
   save_option: string
   cookies: string
   headless: boolean
+  min_video_duration_seconds: number
 }
 
 export interface CrawlerStatus {

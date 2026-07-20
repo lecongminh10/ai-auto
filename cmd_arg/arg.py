@@ -283,6 +283,15 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 rich_help_panel="Basic Configuration",
             ),
         ] = config.CRAWLER_MAX_NOTES_COUNT,
+        min_video_duration_seconds: Annotated[
+            int,
+            typer.Option(
+                "--min_video_duration_seconds",
+                min=0,
+                help="Only keep videos longer than this duration in search mode (Douyin/Bilibili)",
+                rich_help_panel="Basic Configuration",
+            ),
+        ] = config.MIN_VIDEO_DURATION_SECONDS,
         max_concurrency_num: Annotated[
             int,
             typer.Option(
@@ -359,6 +368,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.COOKIES = cookies
         config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = max_comments_count_singlenotes
         config.CRAWLER_MAX_NOTES_COUNT = crawler_max_notes_count
+        config.MIN_VIDEO_DURATION_SECONDS = min_video_duration_seconds
         config.MAX_CONCURRENCY_NUM = max_concurrency_num
         config.SAVE_DATA_PATH = save_data_path
         config.ENABLE_IP_PROXY = enable_ip_proxy_value

@@ -57,6 +57,7 @@ const defaultConfig: CrawlerConfig = {
   save_option: 'jsonl',
   cookies: '',
   headless: false,
+  min_video_duration_seconds: 0,
 }
 
 export const useCrawlerStore = create<CrawlerState>((set, get) => ({

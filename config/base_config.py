@@ -17,7 +17,10 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+import os
+
 # Basic configuration
+WORKSPACE_ROOT = os.getenv("MEDIACRAWLER_WORKSPACE_ROOT", os.getcwd())
 PLATFORM = "xhs"  # Platform, xhs | dy | ks | bili | wb | tieba | zhihu
 
 # 是否使用海外版小红书 (rednote.com)
@@ -102,6 +105,10 @@ START_PAGE = 1
 
 # Control the number of crawled videos/posts
 CRAWLER_MAX_NOTES_COUNT = 15
+
+# Only keep videos longer than this value while searching. Currently applied
+# to Douyin and Bilibili because their detail payloads expose video duration.
+MIN_VIDEO_DURATION_SECONDS = 0
 
 # Controlling the number of concurrent crawlers
 MAX_CONCURRENCY_NUM = 1

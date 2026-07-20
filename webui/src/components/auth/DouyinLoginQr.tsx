@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Loader2, QrCode } from 'lucide-react'
 import { useCrawlerStore } from '@/store/crawlerStore'
+import { workspaceFetch } from '@/lib/workspace'
 
 export function DouyinLoginQr() {
   const status = useCrawlerStore((state) => state.status)
@@ -19,8 +20,8 @@ export function DouyinLoginQr() {
     let cancelled = false
     const loadQr = async () => {
       try {
-        const response = await fetch(`/api/crawler/login-qrcode?t=${Date.now()}`, { cache: 'no-store' })
-        if (!response.ok) {
+        const response = await workspaceFetch(`/api/crawler/login-qrcode?t=${Date.now()}`, { cache: 'no-store' })
+        if (response.status === 204 || !response.ok) {
           setQrUrl((current) => {
             if (current) URL.revokeObjectURL(current)
             return ''

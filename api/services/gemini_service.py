@@ -11,6 +11,14 @@ load_dotenv()
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 _key_cursor = 0
+# Các semaphore phải dùng chung ở cấp process. Nếu tạo bên trong từng job thì
+# tổng số request vẫn tăng theo số người dùng và nhanh chóng chạm rate-limit.
+_SUBTITLE_TRANSLATION_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.getenv("TRANSLATION_GLOBAL_PARALLELISM", "1")))
+)
+_GOOGLE_TRANSLATE_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.getenv("GOOGLE_TRANSLATE_GLOBAL_PARALLELISM", "1")))
+)
 
 
 def _keys() -> list[str]:
@@ -38,24 +46,72 @@ def _parse_json(text: str) -> dict:
     return json.loads(cleaned)
 
 
-async def _translate_with_google_fallback(lines: list[str]) -> list[str]:
-    """Dịch dự phòng từng câu khi toàn bộ Gemini key/quota không khả dụng."""
-    semaphore = asyncio.Semaphore(4)
-    async with httpx.AsyncClient(timeout=30) as client:
-        async def translate_line(line: str) -> str:
-            async with semaphore:
-                response = await client.get(
-                    "https://translate.googleapis.com/translate_a/single",
-                    params={"client": "gtx", "sl": "zh-CN", "tl": "vi", "dt": "t", "q": line},
-                )
-                response.raise_for_status()
-                payload = response.json()
-                value = "".join(part[0] for part in payload[0] if part and part[0]).strip()
-                if not value:
-                    raise RuntimeError("Google Translate trả câu rỗng")
-                return value
+async def _translate_with_google_fallback_unlimited(lines: list[str]) -> list[str]:
+    """Dịch dự phòng tuần tự để tránh Google Translate chặn do quá nhiều request."""
+    endpoints = (
+        "https://translate.googleapis.com/translate_a/single",
+        "https://translate.google.com/translate_a/single",
+    )
+    max_attempts = max(2, int(os.getenv("GOOGLE_TRANSLATE_MAX_RETRIES", "5")))
+    request_delay = max(0.0, float(os.getenv("GOOGLE_TRANSLATE_REQUEST_DELAY", "0.2")))
+    translated: list[str] = []
+    async with httpx.AsyncClient(
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0 MediaCrawler/1.0"},
+    ) as client:
+        for line_number, line in enumerate(lines, 1):
+            errors: list[str] = []
+            for attempt in range(max_attempts):
+                endpoint = endpoints[attempt % len(endpoints)]
+                try:
+                    response = await client.get(
+                        endpoint,
+                        params={
+                            "client": "gtx",
+                            # Whisper may keep short Japanese/Korean phrases
+                            # inside otherwise Chinese videos.
+                            "sl": "auto",
+                            "tl": "vi",
+                            "dt": "t",
+                            "q": line,
+                        },
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    value = "".join(part[0] for part in payload[0] if part and part[0]).strip()
+                    if not value:
+                        raise ValueError("Google Translate trả câu rỗng")
+                    translated.append(value)
+                    break
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    errors.append(f"HTTP {status}")
+                    retry_after = exc.response.headers.get("Retry-After", "")
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        delay = min(10.0, 1.0 * (2 ** attempt))
+                except (httpx.HTTPError, ValueError, TypeError, IndexError, json.JSONDecodeError) as exc:
+                    errors.append(type(exc).__name__)
+                    delay = min(10.0, 1.0 * (2 ** attempt))
 
-        return await asyncio.gather(*(translate_line(line) for line in lines))
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(delay)
+            else:
+                raise RuntimeError(
+                    f"Google Translate thất bại ở câu {line_number}/{len(lines)} "
+                    f"sau {max_attempts} lần thử: {', '.join(errors)}"
+                )
+
+            if request_delay and line_number < len(lines):
+                await asyncio.sleep(request_delay)
+    return translated
+
+
+async def _translate_with_google_fallback(lines: list[str]) -> list[str]:
+    """Xếp các batch Google Translate vào hàng đợi chung của server."""
+    async with _GOOGLE_TRANSLATE_SEMAPHORE:
+        return await _translate_with_google_fallback_unlimited(lines)
 
 
 async def expand_vietnamese_keywords(keywords: list[str]) -> list[str]:
@@ -97,18 +153,43 @@ Không thêm ý nghĩa ngoài yêu cầu. Chỉ trả JSON đúng dạng:
     raise RuntimeError(f"Tất cả Gemini API key đều thất bại: {', '.join(errors)}")
 
 
-async def translate_chinese_subtitles(
-    lines: list[str], on_status: Callable[[str], Awaitable[None]] | None = None
+async def _translate_chinese_subtitles_unlimited(
+    lines: list[str],
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+    durations_ms: list[int] | None = None,
 ) -> list[str]:
     """Dịch phụ đề theo ánh xạ 1-1, ưu tiên câu Việt ngắn và dễ lồng tiếng."""
     keys = _rotated_keys()
     if not keys:
         raise RuntimeError("Gemini chưa được cấu hình; hãy thêm GEMINI_API_KEYS vào .env")
-    prompt = f"""Bạn là biên dịch viên lồng tiếng video ngắn Trung Quốc sang tiếng Việt.
-Dịch từng phần tử tiếng Trung dưới đây sang tiếng Việt tự nhiên, đúng văn phong mạng xã hội.
-Câu dịch phải súc tích, có độ dài nói gần với bản gốc và không thêm ý.
-Giữ đúng số phần tử, đúng thứ tự. Chỉ trả JSON dạng {{"translations":["..."]}}.
-Đầu vào: {json.dumps(lines, ensure_ascii=False)}
+    if durations_ms is None or len(durations_ms) != len(lines):
+        durations_ms = [0] * len(lines)
+    entries = [
+        {
+            "text": line,
+            "duration_ms": duration,
+            # Giọng Việt tự nhiên trong video ngắn thường dễ nghe ở khoảng
+            # 3 từ/giây. Giữ câu thoáng hơn để TTS không phải đọc gấp.
+            "max_vietnamese_words": max(2, round(duration / 320)) if duration else None,
+        }
+        for line, duration in zip(lines, durations_ms)
+    ]
+    prompt = f"""Bạn là biên dịch viên và biên tập lời thoại lồng tiếng chuyên nghiệp.
+Hãy đọc toàn bộ nhóm câu để hiểu ngữ cảnh rồi chuyển từng câu sang tiếng Việt tự nhiên,
+trôi chảy như người Việt đang nói ngoài đời; không dịch máy từng chữ. Ưu tiên câu
+ngắn, thân mật, có nhịp nghỉ bằng dấu phẩy/dấu chấm khi cần để giọng đọc không bị
+liền tù tì. Giữ nhất quán chủ ngữ, đại từ, tên riêng và thuật ngữ giữa các câu. Sửa
+hợp lý lỗi nhận dạng nhỏ nếu ngữ cảnh cho thấy rõ, nhưng không bịa thêm thông tin.
+
+Mỗi câu phải súc tích và không vượt quá max_vietnamese_words, ưu tiên diễn đạt lại
+ngắn hơn thay vì làm giọng đọc chạy nhanh. Tránh văn viết cứng như "do đó", "tuy
+nhiên" nếu có thể nói tự nhiên hơn. Chỉ dùng chữ tiếng Việt/Latin, chữ số và dấu câu
+thông thường. Với đầu vào chỉ là tiếng đệm thì dùng tiếng đệm Việt tự nhiên; với đầu
+vào vô nghĩa hoặc chỉ có ký hiệu thì trả một dấu chấm để giữ khoảng lặng.
+
+Giữ đúng số phần tử và đúng thứ tự. Chỉ trả JSON dạng
+{{"translations":["..."]}}.
+Đầu vào: {json.dumps(entries, ensure_ascii=False)}
 """
     errors: list[str] = []
     async with httpx.AsyncClient(timeout=90) as client:
@@ -128,7 +209,7 @@ Giữ đúng số phần tử, đúng thứ tự. Chỉ trả JSON dạng {{"tra
                         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
                         json={
                             "contents": [{"parts": [{"text": prompt}]}],
-                            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+                            "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
                         },
                     )
                     if response.status_code == 429:
@@ -153,15 +234,10 @@ Giữ đúng số phần tử, đúng thứ tự. Chỉ trả JSON dạng {{"tra
                     errors.append(f"HTTP {exc.response.status_code}: {exc.response.text[:160]}")
                 except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     errors.append(type(exc).__name__)
-            if retry_after and retry_round < 7:
-                delay = min(90.0, max(5.0, max(retry_after) + 1.0))
-                if on_status:
-                    await on_status(
-                        f"Gemini tạm giới hạn/quá tải; chờ {delay:.0f} giây rồi thử lại "
-                        f"({retry_round + 1}/8)."
-                    )
-                await asyncio.sleep(delay)
-                continue
+            if retry_after:
+                # 429 thường là quota theo Google project, chờ nhiều vòng vẫn
+                # không giải quyết được. Chuyển ngay sang phương án dự phòng.
+                break
             break
     if on_status:
         await on_status("Gemini không khả dụng; chuyển sang Google Translate dự phòng.")
@@ -170,5 +246,17 @@ Giữ đúng số phần tử, đúng thứ tự. Chỉ trả JSON dạng {{"tra
     except (httpx.HTTPError, RuntimeError, ValueError, TypeError, IndexError) as exc:
         raise RuntimeError(
             f"Không thể dịch phụ đề bằng Gemini ({', '.join(errors)}) "
-            f"hoặc Google Translate ({type(exc).__name__})"
+            f"hoặc Google Translate ({exc})"
         ) from exc
+
+
+async def translate_chinese_subtitles(
+    lines: list[str],
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+    durations_ms: list[int] | None = None,
+) -> list[str]:
+    """Dịch phụ đề qua hàng đợi chung để nhiều job không dội request vào API."""
+    if _SUBTITLE_TRANSLATION_SEMAPHORE.locked() and on_status:
+        await on_status("Đang chờ lượt dịch; server đang xử lý một video khác...")
+    async with _SUBTITLE_TRANSLATION_SEMAPHORE:
+        return await _translate_chinese_subtitles_unlimited(lines, on_status, durations_ms)

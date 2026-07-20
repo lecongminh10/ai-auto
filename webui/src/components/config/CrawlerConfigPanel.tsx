@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from 'react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Globe, KeyRound, Play, Square } from 'lucide-react'
 import { Label } from '@/components/ui/label'
@@ -7,6 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { useCrawlerStore } from '@/store/crawlerStore'
+import { workspaceFetch } from '@/lib/workspace'
 import { usePlatforms, useConfigOptions, useStartCrawler, useStopCrawler } from '@/hooks/useCrawler'
 
 type SectionProps = {
@@ -95,21 +96,57 @@ export function CrawlerConfigPanel() {
   const { mutate: stopCrawler, isPending: isStopping } = useStopCrawler()
   const [isTranslating, setIsTranslating] = useState(false)
   const [translatedKeywords, setTranslatedKeywords] = useState('')
+  const [douyinAuthenticated, setDouyinAuthenticated] = useState(false)
 
   const isDisabled = status === 'running' || status === 'stopping'
   const isRunning = status === 'running'
   const isBusy = isStarting || isStopping || isTranslating || status === 'stopping'
 
+  useEffect(() => {
+    if (config.platform !== 'dy' || status === 'running') return
+    void workspaceFetch('/api/crawler/auth-status', { cache: 'no-store' })
+      .then((response) => response.json())
+      .then((payload) => setDouyinAuthenticated(Boolean(payload.authenticated)))
+      .catch(() => setDouyinAuthenticated(false))
+  }, [config.platform, status])
+
+  const resetDouyinLogin = async () => {
+    if (!window.confirm('Xóa phiên Douyin của workspace này và đăng nhập lại bằng QR?')) return
+    const response = await workspaceFetch('/api/crawler/logout', { method: 'POST' })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) return alert(payload.detail || 'Không thể xóa phiên Douyin')
+    setDouyinAuthenticated(false)
+    alert('Đã xóa phiên Douyin của workspace này. Lần crawl tiếp theo sẽ hiện QR mới.')
+  }
+
   const handleStart = async () => {
     setIsTranslating(true)
     try {
-      const response = await fetch('/api/videos/translate-keywords', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords: config.keywords }),
-      })
-      const payload = await response.json()
-      if (!response.ok) throw new Error(payload.detail || 'Không thể dịch từ khóa')
+      let response: Response | undefined
+      let payload: { crawler_keywords?: string; detail?: string } = {}
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        response = await workspaceFetch('/api/videos/translate-keywords', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keywords: config.keywords }),
+        })
+        const body = await response.text()
+        try {
+          payload = JSON.parse(body)
+        } catch {
+          payload = {}
+        }
+        if (response.ok) break
+        if (![404, 502, 503, 504].includes(response.status) || attempt === 2) {
+          throw new Error(
+            payload.detail || `Backend dịch từ khóa chưa sẵn sàng (HTTP ${response.status})`,
+          )
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1000 * (attempt + 1)))
+      }
+      if (!response?.ok || !payload.crawler_keywords) {
+        throw new Error('Backend không trả về từ khóa tiếng Trung hợp lệ')
+      }
       setTranslatedKeywords(payload.crawler_keywords)
       startCrawler({ ...config, crawler_type: 'search', keywords: payload.crawler_keywords })
     } catch (error) {
@@ -168,6 +205,20 @@ export function CrawlerConfigPanel() {
               </p>
             )}
           </Field>
+
+          <Field label="Video dài hơn (phút)" hint="Để 0 để hiện mọi video; chỉ tăng khi thật sự cần lọc video dài.">
+            <Input
+              type="number"
+              min="0"
+              step="1"
+              value={config.min_video_duration_seconds / 60}
+              onChange={(event) => updateConfig({
+                min_video_duration_seconds: Math.max(0, Number(event.target.value || 0) * 60),
+              })}
+              disabled={isDisabled || !['dy', 'bili'].includes(config.platform)}
+              className="h-9 text-xs"
+            />
+          </Field>
         </Section>
 
         {/* Column 2: Authentication Section */}
@@ -194,6 +245,19 @@ export function CrawlerConfigPanel() {
               </SelectContent>
             </Select>
           </Field>
+
+          {config.platform === 'dy' && (
+            <div className="flex items-center justify-between rounded border border-cyber-border-subtle bg-cyber-bg-tertiary/40 p-3 text-[11px]">
+              <span className={douyinAuthenticated ? 'text-cyber-neon-green' : 'text-cyber-text-muted'}>
+                {douyinAuthenticated ? 'Workspace này đã đăng nhập Douyin' : 'Workspace này chưa đăng nhập Douyin'}
+              </span>
+              {douyinAuthenticated && (
+                <Button type="button" size="sm" variant="outline" onClick={resetDouyinLogin} disabled={isDisabled}>
+                  Đăng xuất / đổi tài khoản
+                </Button>
+              )}
+            </div>
+          )}
 
           {config.login_type === 'cookie' ? (
             <Field label={t('field.cookies')} hint={t('field.cookiesHint')}>

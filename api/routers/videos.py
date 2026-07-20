@@ -4,23 +4,81 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..services.gemini_service import expand_vietnamese_keywords, is_configured
-from ..services.dubbing_service import dub, transcribe
+from ..services.dubbing_service import dub, parse_srt, transcribe
+from ..services.media_social_service import handoff
+from ..workspace import get_workspace_id, workspace_data_dir, workspace_root, workspace_video_dir
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data"
-VIDEO_DIR = PROJECT_ROOT / "video"
 _DUB_JOBS: dict[str, dict] = {}
+_ACTIVE_DUB_RENDERS: dict[str, str] = {}
+
+
+def _dub_job_path(workspace_id: str, job_id: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+        return None
+    return workspace_root(workspace_id) / "jobs" / "dubbing" / f"{job_id}.json"
+
+
+def _persist_dub_job(job: dict) -> None:
+    path = _dub_job_path(job.get("workspace_id", "default"), job.get("job_id", ""))
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(job, ensure_ascii=False), "utf-8")
+    temporary.replace(path)
+
+
+def _store_dub_job(job: dict) -> dict:
+    _DUB_JOBS[job["job_id"]] = job
+    _persist_dub_job(job)
+    return job
+
+
+def _update_dub_job(job: dict, **values) -> None:
+    job.update(values)
+    _persist_dub_job(job)
+
+
+def _load_dub_job(workspace_id: str, job_id: str) -> dict | None:
+    path = _dub_job_path(workspace_id, job_id)
+    if path is None or not path.is_file():
+        return None
+    try:
+        job = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(job, dict) or job.get("workspace_id", "default") != workspace_id:
+        return None
+    _DUB_JOBS[job_id] = job
+    return job
+
+
+def _claim_dub_render(work_dir: Path, job_id: str) -> str | None:
+    """Đăng ký job hoặc trả job đang xử lý cùng video để client theo dõi lại."""
+    key = str(work_dir.resolve())
+    existing_job_id = _ACTIVE_DUB_RENDERS.get(key)
+    if existing_job_id:
+        return existing_job_id
+    _ACTIVE_DUB_RENDERS[key] = job_id
+    return None
+
+
+def _release_dub_render(work_dir: Path, job_id: str | None = None) -> None:
+    key = str(work_dir.resolve())
+    if job_id is None or _ACTIVE_DUB_RENDERS.get(key) == job_id:
+        _ACTIVE_DUB_RENDERS.pop(key, None)
 
 
 def _append_job_log(job: dict, message: str) -> None:
@@ -29,6 +87,7 @@ def _append_job_log(job: dict, message: str) -> None:
     if not logs or logs[-1] != entry:
         logs.append(entry)
         del logs[:-100]
+        _persist_dub_job(job)
 
 
 def _number(value) -> int:
@@ -38,8 +97,22 @@ def _number(value) -> int:
         return 0
 
 
-def _read_records(platform: str) -> list[dict]:
-    platform_dir = DATA_DIR / ({"dy": "douyin", "bili": "bilibili"}.get(platform, platform))
+def _cached_transcript(work_dir: Path) -> str | None:
+    """Tận dụng transcript hoàn chỉnh nếu UI mất job nhưng Whisper đã chạy xong."""
+    video = work_dir / "video.mp4"
+    transcript_path = work_dir / "audio.srt"
+    if not video.is_file() or not transcript_path.is_file():
+        return None
+    try:
+        transcript = transcript_path.read_text("utf-8")
+        parse_srt(transcript)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return transcript
+
+
+def _read_records(platform: str, workspace_id: str = "default") -> list[dict]:
+    platform_dir = workspace_data_dir(workspace_id) / ({"dy": "douyin", "bili": "bilibili"}.get(platform, platform))
     records: list[dict] = []
     if not platform_dir.exists():
         return records
@@ -88,11 +161,12 @@ def _normalize(platform: str, item: dict) -> dict:
         "comments": _number(item.get("comment_count") or item.get("video_comment")),
         "shares": _number(item.get("share_count") or item.get("video_share_count")),
         "collections": _number(item.get("collected_count") or item.get("video_favorite_count")),
+        "duration_seconds": _number(item.get("duration_seconds")),
     }
 
 
-def _find_video(platform: str, video_id: str) -> dict | None:
-    for raw in _read_records(platform):
+def _find_video(platform: str, video_id: str, workspace_id: str = "default") -> dict | None:
+    for raw in _read_records(platform, workspace_id):
         video = _normalize(platform, raw)
         if video["id"] == video_id:
             return video
@@ -100,9 +174,14 @@ def _find_video(platform: str, video_id: str) -> dict | None:
 
 
 @router.get("/stream")
-async def stream_video(request: Request, platform: Literal["dy", "xhs"], video_id: str):
+async def stream_video(
+    request: Request,
+    platform: Literal["dy", "xhs"],
+    video_id: str,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
     """Proxy luồng video để trình duyệt phát được Range request và redirect CDN."""
-    video = _find_video(platform, video_id)
+    video = _find_video(platform, video_id, workspace_id)
     if not video or not video["preview_url"]:
         raise HTTPException(404, "Không tìm thấy URL preview của video")
 
@@ -144,16 +223,18 @@ async def stream_video(request: Request, platform: Literal["dy", "xhs"], video_i
 @router.get("")
 async def list_videos(
     platform: Literal["dy", "xhs", "bili"],
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
     keyword: str = "",
     min_views: int = Query(0, ge=0),
     min_likes: int = Query(0, ge=0),
     min_comments: int = Query(0, ge=0),
     min_shares: int = Query(0, ge=0),
+    min_duration_seconds: int = Query(0, ge=0),
     sort_by: Literal["views", "likes", "comments", "shares", "collections"] = "views",
 ):
     seen: set[str] = set()
     videos = []
-    for raw in _read_records(platform):
+    for raw in _read_records(platform, workspace_id):
         video = _normalize(platform, raw)
         if not video["id"] or video["id"] in seen:
             continue
@@ -168,6 +249,8 @@ async def list_videos(
         if video["likes"] < min_likes:
             continue
         if video["comments"] < min_comments or video["shares"] < min_shares:
+            continue
+        if platform in {"dy", "bili"} and min_duration_seconds and video["duration_seconds"] <= min_duration_seconds:
             continue
         videos.append(video)
     videos.sort(key=lambda value: value[sort_by], reverse=True)
@@ -193,6 +276,19 @@ class DubbingRenderRequest(BaseModel):
     transcript_srt: str
     voice: Literal["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"] = "vi-VN-HoaiMyNeural"
     mood: Literal["natural", "energetic", "warm"] = "natural"
+
+
+class SocialSendRequest(BaseModel):
+    platform: Literal["dy", "xhs", "bili"]
+    video_id: str
+
+
+def _handoff_metadata(platform: str, video_id: str, workspace_id: str = "default") -> dict:
+    video = _find_video(platform, video_id, workspace_id) or {}
+    return {
+        key: video.get(key, "")
+        for key in ("title", "author", "source_url", "source_keyword")
+    }
 
 
 @router.post("/translate-keywords")
@@ -240,7 +336,10 @@ async def translate_keywords(request: TranslateRequest):
 
 
 @router.post("/download")
-async def download_video(request: DownloadRequest):
+async def download_video(
+    request: DownloadRequest,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
     parsed = urlparse(request.url)
     allowed_hosts = {
         "dy": ("douyin.com", "douyinstatic.com"),
@@ -250,7 +349,7 @@ async def download_video(request: DownloadRequest):
     if parsed.scheme not in {"http", "https"} or not any(parsed.hostname and parsed.hostname.endswith(host) for host in allowed_hosts[request.platform]):
         raise HTTPException(400, "URL video không hợp lệ")
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", request.video_id)
-    target_dir = VIDEO_DIR / request.platform / safe_id
+    target_dir = workspace_video_dir(workspace_id) / request.platform / safe_id
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / "video.mp4"
     try:
@@ -263,34 +362,47 @@ async def download_video(request: DownloadRequest):
     except httpx.HTTPError as exc:
         target.unlink(missing_ok=True)
         raise HTTPException(502, f"Không thể tải video: {exc}") from exc
-    return {"success": True, "path": str(target.relative_to(PROJECT_ROOT)), "size": target.stat().st_size}
+    return {"success": True, "path": str(target), "size": target.stat().st_size}
 
 
 @router.post("/dub/prepare")
-async def prepare_dubbing(request: DubbingPrepareRequest):
+async def prepare_dubbing(
+    request: DubbingPrepareRequest,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
     """Tạo job nền để tải video và nhận diện transcript."""
     if request.platform != "dy":
         raise HTTPException(400, "Hiện pipeline lồng tiếng chỉ hỗ trợ video Douyin")
     job_id = uuid.uuid4().hex
-    _DUB_JOBS[job_id] = {"job_id": job_id, "video_id": request.video_id, "status": "running", "stage": "Đang chuẩn bị...", "progress": 0, "transcript_srt": "", "error": "", "logs": []}
-    asyncio.create_task(_prepare_dubbing_job(job_id, request))
+    _store_dub_job({"job_id": job_id, "workspace_id": workspace_id, "video_id": request.video_id, "status": "running", "stage": "Đang chuẩn bị...", "progress": 0, "transcript_srt": "", "error": "", "logs": []})
+    asyncio.create_task(_prepare_dubbing_job(job_id, request, workspace_id))
     return {"job_id": job_id, "video_id": request.video_id}
 
 
-async def _prepare_dubbing_job(job_id: str, request: DubbingPrepareRequest):
+async def _prepare_dubbing_job(job_id: str, request: DubbingPrepareRequest, workspace_id: str):
     job = _DUB_JOBS[job_id]
     try:
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", request.video_id)
-        work_dir = VIDEO_DIR / "dy" / safe_id
+        work_dir = workspace_video_dir(workspace_id) / "dy" / safe_id
+        transcript = _cached_transcript(work_dir)
+        if transcript is not None:
+            _update_dub_job(
+                job,
+                status="done",
+                stage="Đã khôi phục transcript Whisper có sẵn.",
+                progress=100,
+                transcript_srt=transcript,
+            )
+            return
         await _download_dubbing_video(request, work_dir, job)
-        job.update(stage="Đã tải xong. Đang tách audio WAV 16 kHz...", progress=30)
-        job.update(stage="Đang chạy Whisper model small nhận diện tiếng Trung (lần đầu có thể tải model)...", progress=40)
+        _update_dub_job(job, stage="Đã tải xong. Đang tách audio WAV 16 kHz...", progress=30)
+        _update_dub_job(job, stage="Đang chạy Whisper model small nhận diện tiếng Trung (lần đầu có thể tải model)...", progress=40)
         async def whisper_progress(done: int, total: int):
-            job.update(stage=f"Whisper đang xử lý đoạn {done}/{total} (tối đa 3 đoạn song song)...", progress=40 + int(done / total * 55))
+            _update_dub_job(job, stage=f"Whisper đang xử lý đoạn {done}/{total} (tối đa 3 đoạn song song)...", progress=40 + int(done / total * 55))
         transcript = await transcribe(work_dir / "video.mp4", work_dir, whisper_progress)
-        job.update(status="done", stage="Đã nhận diện xong transcript.", progress=100, transcript_srt=transcript)
+        _update_dub_job(job, status="done", stage="Đã nhận diện xong transcript.", progress=100, transcript_srt=transcript)
     except (RuntimeError, ValueError, OSError) as exc:
-        job.update(status="error", stage="Pipeline dừng do lỗi.", error=str(exc))
+        _update_dub_job(job, status="error", stage="Pipeline dừng do lỗi.", error=str(exc))
 
 
 async def _download_dubbing_video(request: DubbingPrepareRequest, work_dir: Path, job: dict):
@@ -330,7 +442,7 @@ async def _download_dubbing_video(request: DubbingPrepareRequest, work_dir: Path
                             else:
                                 percent = 10
                                 stage = f"Đang tải video gốc... {downloaded / 1048576:.1f} MB"
-                            job.update(stage=stage, progress=percent)
+                            _update_dub_job(job, stage=stage, progress=percent)
                 if total and downloaded < total:
                     raise RuntimeError(f"CDN ngắt ở {downloaded}/{total} byte")
                 return
@@ -341,37 +453,51 @@ async def _download_dubbing_video(request: DubbingPrepareRequest, work_dir: Path
                     downloaded = 0
                     total = 0
                     target.unlink(missing_ok=True)
-                    job.update(stage="URL CDN đã thay đổi, bắt đầu tải lại từ đầu...", progress=5)
+                    _update_dub_job(job, stage="URL CDN đã thay đổi, bắt đầu tải lại từ đầu...", progress=5)
                     continue
                 last_error = exc
-                job.update(stage=f"Mạng/CDN lỗi, đang tải tiếp (lần {attempt + 1}/6)...", progress=min(24, 5 + attempt * 3))
+                _update_dub_job(job, stage=f"Mạng/CDN lỗi, đang tải tiếp (lần {attempt + 1}/6)...", progress=min(24, 5 + attempt * 3))
                 await asyncio.sleep(min(2 ** attempt, 10))
             except (httpx.HTTPError, OSError, RuntimeError) as exc:
                 last_error = exc
-                job.update(stage=f"Mạng gián đoạn, đang tải tiếp (lần {attempt + 1}/6)...", progress=min(24, 5 + attempt * 3))
+                _update_dub_job(job, stage=f"Mạng gián đoạn, đang tải tiếp (lần {attempt + 1}/6)...", progress=min(24, 5 + attempt * 3))
                 await asyncio.sleep(min(2 ** attempt, 10))
     raise RuntimeError(f"Tải video thất bại sau khi thử tiếp 6 lần: {last_error}")
 
 
 @router.get("/dub/status/{job_id}")
-async def dubbing_job_status(job_id: str):
-    job = _DUB_JOBS.get(job_id)
-    if not job:
+async def dubbing_job_status(
+    job_id: str,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
+    # Đọc file trước để polling vẫn thấy job nếu request được chuyển sang
+    # worker khác hoặc dictionary RAM vừa bị mất do reload.
+    job = _load_dub_job(workspace_id, job_id) or _DUB_JOBS.get(job_id)
+    if not job or job.get("workspace_id", "default") != workspace_id:
         raise HTTPException(404, "Không tìm thấy job lồng tiếng")
     return job
 
 
 @router.post("/dub/render")
-async def render_dubbing(request: DubbingRenderRequest):
+async def render_dubbing(
+    request: DubbingRenderRequest,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
     """Tạo job nền để request không timeout với video dài."""
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", request.video_id)
-    work_dir = VIDEO_DIR / "dy" / safe_id
+    work_dir = workspace_video_dir(workspace_id) / "dy" / safe_id
     video_path = work_dir / "video.mp4"
     if not video_path.exists():
         raise HTTPException(404, "Chưa có video gốc; hãy chạy bước tạo transcript trước")
     job_id = uuid.uuid4().hex
-    _DUB_JOBS[job_id] = {
+    existing_job_id = _claim_dub_render(work_dir, job_id)
+    if existing_job_id:
+        # Hai tab bấm cùng video không phải là lỗi. Cho tab mới theo dõi đúng
+        # job đang chạy thay vì trả 409 và hiện "Pipeline dừng" giả.
+        return {"job_id": existing_job_id, "video_id": request.video_id, "reused": True}
+    _store_dub_job({
         "job_id": job_id,
+        "workspace_id": workspace_id,
         "video_id": request.video_id,
         "status": "running",
         "stage": "Đang chuẩn bị dịch phụ đề...",
@@ -380,13 +506,19 @@ async def render_dubbing(request: DubbingRenderRequest):
         "error": "",
         "output_url": "",
         "logs": [],
-    }
-    asyncio.create_task(_render_dubbing_job(job_id, request, video_path, work_dir))
+    })
+    try:
+        asyncio.create_task(_render_dubbing_job(job_id, request, video_path, work_dir, workspace_id))
+    except Exception:
+        _release_dub_render(work_dir, job_id)
+        _DUB_JOBS.pop(job_id, None)
+        raise
     return {"job_id": job_id, "video_id": request.video_id}
 
 
 async def _render_dubbing_job(
-    job_id: str, request: DubbingRenderRequest, video_path: Path, work_dir: Path
+    job_id: str, request: DubbingRenderRequest, video_path: Path, work_dir: Path,
+    workspace_id: str,
 ):
     job = _DUB_JOBS[job_id]
 
@@ -394,34 +526,46 @@ async def _render_dubbing_job(
         total = max(total, 1)
         if stage == "translate":
             message = f"Đang dịch phụ đề: nhóm {done}/{total}..."
-            job.update(
+            _update_dub_job(
+                job,
                 stage=message,
                 progress=min(25, int(done / total * 25)),
             )
             _append_job_log(job, message)
         elif stage == "tts":
             message = f"Đang tạo giọng đọc: câu {done}/{total}..."
-            job.update(
+            _update_dub_job(
+                job,
                 stage=message,
                 progress=25 + int(done / total * 65),
             )
             _append_job_log(job, message)
         elif stage == "mux":
             message = "Đang ghép âm thanh vào video..." if not done else "Đã ghép video xong."
-            job.update(
+            _update_dub_job(
+                job,
                 stage=message,
                 progress=92 if not done else 100,
             )
             _append_job_log(job, message)
         else:
-            job.update(stage=stage)
+            _update_dub_job(job, stage=stage)
             _append_job_log(job, stage)
 
     try:
         await dub(
             video_path, work_dir, request.transcript_srt, request.voice, request.mood, progress
         )
-        job.update(
+        handoff.start(
+            work_dir / "output_vi.mp4",
+            platform="dy",
+            video_id=request.video_id,
+            variant="dubbed",
+            metadata=_handoff_metadata("dy", request.video_id, workspace_id),
+            workspace_id=workspace_id,
+        )
+        _update_dub_job(
+            job,
             status="done",
             stage="Hoàn tất: video lồng tiếng đã sẵn sàng.",
             progress=100,
@@ -429,15 +573,52 @@ async def _render_dubbing_job(
         )
     except (RuntimeError, ValueError, OSError) as exc:
         _append_job_log(job, f"LỖI: {exc}")
-        job.update(status="error", stage="Pipeline lồng tiếng dừng do lỗi.", error=str(exc))
+        _update_dub_job(job, status="error", stage="Pipeline lồng tiếng dừng do lỗi.", error=str(exc))
+    finally:
+        _release_dub_render(work_dir, job_id)
 
 
 @router.get("/dub/output/{video_id}")
-async def get_dubbed_video(video_id: str):
+async def get_dubbed_video(
+    video_id: str,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", video_id)
-    output = VIDEO_DIR / "dy" / safe_id / "output_vi.mp4"
+    output = workspace_video_dir(workspace_id) / "dy" / safe_id / "output_vi.mp4"
     if not output.exists():
         raise HTTPException(404, "Video lồng tiếng chưa được tạo")
     # Không dọn file trung gian tại đây: trình duyệt có thể mở link output cũ
     # trong khi một job retry đang dùng các file TTS/cache cùng thư mục.
     return FileResponse(output, media_type="video/mp4", filename=f"{safe_id}_vi.mp4")
+
+
+@router.post("/social/send")
+async def send_video_to_media_social(
+    request: SocialSendRequest,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", request.video_id).strip("_")
+    if not safe_id:
+        raise HTTPException(400, "Video ID không hợp lệ")
+    video = workspace_video_dir(workspace_id) / request.platform / safe_id / "output_vi.mp4"
+    if not video.is_file():
+        raise HTTPException(404, "Video chưa lồng tiếng; chỉ output_vi.mp4 được gửi sang MediaSocial")
+    return handoff.start(
+        video,
+        platform=request.platform,
+        video_id=safe_id,
+        variant="dubbed",
+        metadata=_handoff_metadata(request.platform, safe_id, workspace_id),
+        workspace_id=workspace_id,
+    )
+
+
+@router.get("/social/status/{job_id}")
+async def media_social_handoff_status(
+    job_id: str,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
+    job = handoff.jobs.get(job_id)
+    if not job or job.get("workspace_id", "default") != workspace_id:
+        raise HTTPException(404, "Không tìm thấy job gửi MediaSocial")
+    return job

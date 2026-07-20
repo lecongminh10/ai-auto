@@ -169,6 +169,7 @@ async def update_douyin_aweme(aweme_item: Dict):
         "nickname": mask_nickname(user_info.get("nickname")),  # 用户昵称(已脱敏)
         "liked_count": str(interact_info.get("digg_count")),
         "video_play_count": str(interact_info.get("play_count", 0)),
+        "duration_seconds": int((aweme_item.get("video") or {}).get("duration") or 0) // 1000,
         "collected_count": str(interact_info.get("collect_count")),
         "comment_count": str(interact_info.get("comment_count")),
         "share_count": str(interact_info.get("share_count")),

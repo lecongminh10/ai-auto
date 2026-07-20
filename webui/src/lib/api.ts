@@ -1,10 +1,12 @@
 import axios from 'axios'
+import { workspaceId } from '@/lib/workspace'
 
 const api = axios.create({
   baseURL: '/api',
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
+    'X-Workspace-ID': workspaceId,
   },
 })
 

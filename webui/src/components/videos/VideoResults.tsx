@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertCircle, CheckCircle2, Download, ExternalLink, Eye, Heart, Languages, Loader2, MessageCircle, RefreshCw, Share2 } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Clock3, Download, ExternalLink, Eye, Heart, Languages, Loader2, MessageCircle, RefreshCw, Send, Share2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useCrawlerStore } from '@/store/crawlerStore'
+import { withWorkspace, workspaceFetch } from '@/lib/workspace'
 
 type VideoItem = {
   id: string
@@ -19,17 +20,20 @@ type VideoItem = {
   comments: number
   shares: number
   collections: number
+  duration_seconds: number
 }
 
 const compact = new Intl.NumberFormat('vi-VN', { notation: 'compact', maximumFractionDigits: 1 })
 
 export function VideoResults() {
   const platform = useCrawlerStore((state) => state.config.platform) as VideoItem['platform']
+  const configuredMinDuration = useCrawlerStore((state) => state.config.min_video_duration_seconds)
   const status = useCrawlerStore((state) => state.status)
   const [videos, setVideos] = useState<VideoItem[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
   const [downloading, setDownloading] = useState(false)
+  const [socialSending, setSocialSending] = useState(false)
   const [dubbing, setDubbing] = useState(false)
   const [dubVideo, setDubVideo] = useState<VideoItem | null>(null)
   const [transcript, setTranscript] = useState('')
@@ -41,7 +45,7 @@ export function VideoResults() {
   const [dubError, setDubError] = useState('')
   const [dubProgress, setDubProgress] = useState(0)
   const [dubLogs, setDubLogs] = useState<string[]>([])
-  const [filters, setFilters] = useState({ minViews: '0', minLikes: '0', minComments: '0', minShares: '0', sortBy: 'views' })
+  const [filters, setFilters] = useState({ minViews: '0', minLikes: '0', minComments: '0', minShares: '0', minDuration: String(configuredMinDuration), sortBy: 'views' })
 
   const loadVideos = useCallback(async () => {
     setLoading(true)
@@ -52,9 +56,10 @@ export function VideoResults() {
         min_likes: filters.minLikes || '0',
         min_comments: filters.minComments || '0',
         min_shares: filters.minShares || '0',
+        min_duration_seconds: filters.minDuration || '0',
         sort_by: filters.sortBy,
       })
-      const response = await fetch(`/api/videos?${query}`)
+      const response = await workspaceFetch(`/api/videos?${query}`)
       const payload = await response.json()
       setVideos(payload.videos || [])
       setSelected(new Set())
@@ -72,6 +77,10 @@ export function VideoResults() {
     }
   }, [platform, status]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    setFilters((current) => ({ ...current, minDuration: String(configuredMinDuration) }))
+  }, [configuredMinDuration])
+
   const selectedVideos = useMemo(() => videos.filter((video) => selected.has(video.id)), [videos, selected])
 
   const toggle = (id: string) => {
@@ -86,7 +95,7 @@ export function VideoResults() {
     try {
       for (const video of selectedVideos) {
         if (!video.preview_url) continue
-        const response = await fetch('/api/videos/download', {
+        const response = await workspaceFetch('/api/videos/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ platform: video.platform, video_id: video.id, url: video.preview_url }),
@@ -104,6 +113,36 @@ export function VideoResults() {
     }
   }
 
+  const sendSelectedToMediaSocial = async () => {
+    const video = selectedVideos[0]
+    if (!video || selectedVideos.length !== 1) return
+    setSocialSending(true)
+    try {
+      const response = await workspaceFetch('/api/videos/social/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform: video.platform, video_id: video.id }),
+      })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload.detail || 'Không thể tạo job gửi MediaSocial')
+      for (;;) {
+        await new Promise((resolve) => window.setTimeout(resolve, 750))
+        const statusResponse = await workspaceFetch(`/api/videos/social/status/${payload.job_id}?t=${Date.now()}`, { cache: 'no-store' })
+        const job = await statusResponse.json().catch(() => ({}))
+        if (!statusResponse.ok) throw new Error(job.detail || 'Không tìm thấy job gửi MediaSocial')
+        if (job.status === 'error') throw new Error(job.error || 'Gửi MediaSocial thất bại')
+        if (job.status === 'done') {
+          alert(`Đã gửi bản lồng tiếng của video ${video.id} sang MediaSocial`)
+          break
+        }
+      }
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Gửi MediaSocial thất bại')
+    } finally {
+      setSocialSending(false)
+    }
+  }
+
   const prepareDubbing = async () => {
     const video = selectedVideos[0]
     if (!video || selectedVideos.length !== 1) return
@@ -114,7 +153,7 @@ export function VideoResults() {
     setDubLogs([])
     setDubStage('Đang tải video gốc và tách audio...')
     try {
-      const response = await fetch('/api/videos/dub/prepare', {
+      const response = await workspaceFetch('/api/videos/dub/prepare', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ platform: video.platform, video_id: video.id, url: video.preview_url }),
       })
@@ -122,7 +161,7 @@ export function VideoResults() {
       if (!response.ok) throw new Error(payload.detail || 'Không thể tạo job nhận diện lời thoại')
       for (;;) {
         await new Promise((resolve) => window.setTimeout(resolve, 1000))
-        const statusResponse = await fetch(`/api/videos/dub/status/${payload.job_id}?t=${Date.now()}`, { cache: 'no-store' })
+        const statusResponse = await workspaceFetch(`/api/videos/dub/status/${payload.job_id}?t=${Date.now()}`, { cache: 'no-store' })
         if (!statusResponse.ok) {
           const errorPayload = await statusResponse.json().catch(() => ({}))
           throw new Error(errorPayload.detail || `Không tìm thấy job xử lý (${statusResponse.status})`)
@@ -153,7 +192,7 @@ export function VideoResults() {
     setDubProgress(0)
     setDubStage('Đang dịch phụ đề Trung → Việt bằng Gemini...')
     try {
-      const response = await fetch('/api/videos/dub/render', {
+      const response = await workspaceFetch('/api/videos/dub/render', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ video_id: dubVideo.id, transcript_srt: transcript, voice, mood }),
       })
@@ -161,7 +200,7 @@ export function VideoResults() {
       if (!response.ok) throw new Error(payload.detail || 'Không thể tạo video lồng tiếng')
       for (;;) {
         await new Promise((resolve) => window.setTimeout(resolve, 1000))
-        const statusResponse = await fetch(`/api/videos/dub/status/${payload.job_id}?t=${Date.now()}`, { cache: 'no-store' })
+        const statusResponse = await workspaceFetch(`/api/videos/dub/status/${payload.job_id}?t=${Date.now()}`, { cache: 'no-store' })
         const job = await statusResponse.json().catch(() => ({}))
         if (!statusResponse.ok) throw new Error(job.detail || `Không tìm thấy job lồng tiếng (${statusResponse.status})`)
         setDubStage(job.stage || 'Đang lồng tiếng...')
@@ -197,6 +236,17 @@ export function VideoResults() {
             className="h-8 w-28 text-[11px]"
           />
         ))}
+        <Input
+          type="number"
+          min="0"
+          step="1"
+          value={Number(filters.minDuration || 0) / 60}
+          onChange={(event) => setFilters({ ...filters, minDuration: String(Math.max(0, Number(event.target.value || 0) * 60)) })}
+          placeholder="Phút tối thiểu"
+          title="Chỉ hiện video dài hơn số phút này"
+          disabled={!['dy', 'bili'].includes(platform)}
+          className="h-8 w-28 text-[11px]"
+        />
         <Select value={filters.sortBy} onValueChange={(sortBy) => setFilters({ ...filters, sortBy })}>
           <SelectTrigger className="h-8 w-32 text-[11px]"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -218,11 +268,21 @@ export function VideoResults() {
           title={platform !== 'dy' ? 'Hiện chỉ hỗ trợ Douyin' : 'Chọn đúng một video'}>
           <Languages className="h-4 w-4" /> {dubbing ? 'Đang xử lý...' : 'Lồng tiếng Việt'}
         </Button>
+        <Button size="sm" variant="outline" className="h-8" onClick={sendSelectedToMediaSocial}
+          disabled={selectedVideos.length !== 1 || socialSending}
+          title="Chỉ gửi output_vi.mp4 sau khi đã lồng tiếng">
+          {socialSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+          {socialSending ? 'Đang gửi...' : 'Gửi MediaSocial'}
+        </Button>
       </header>
 
-      <div className="max-h-[300px] overflow-auto p-3">
+      <div className="max-h-[300px] overflow-auto p-3 pb-8">
         {videos.length === 0 ? (
-          <p className="py-8 text-center text-xs text-cyber-text-muted">Hãy crawl theo từ khóa, sau đó kết quả sẽ xuất hiện tại đây để lọc và xem trước.</p>
+          <p className="py-8 text-center text-xs text-cyber-text-muted">
+            {status === 'idle' && Number(filters.minDuration) > 0
+              ? 'Không có video phù hợp. Hãy giảm “Video dài hơn” về 0 phút rồi crawl lại.'
+              : 'Hãy crawl theo từ khóa, sau đó kết quả sẽ xuất hiện tại đây để lọc và xem trước.'}
+          </p>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
             {videos.map((video) => (
@@ -233,7 +293,7 @@ export function VideoResults() {
                       controls
                       preload="none"
                       poster={video.cover_url}
-                      src={`/api/videos/stream?platform=${video.platform}&video_id=${encodeURIComponent(video.id)}`}
+                      src={withWorkspace(`/api/videos/stream?platform=${video.platform}&video_id=${encodeURIComponent(video.id)}`)}
                       className="h-full w-full object-contain"
                     />
                   ) : video.cover_url ? (
@@ -246,6 +306,7 @@ export function VideoResults() {
                 <div className="p-2 space-y-1.5">
                   <p className="text-xs line-clamp-2 text-cyber-text-primary" title={video.title}>{video.title}</p>
                   <div className="flex gap-3 text-[10px] text-cyber-text-muted">
+                    <span title="Thời lượng"><Clock3 className="inline h-3 w-3" /> {video.duration_seconds ? `${Math.floor(video.duration_seconds / 60)}:${String(video.duration_seconds % 60).padStart(2, '0')}` : '—'}</span>
                     <span title={video.views ? 'Lượt xem' : 'Nền tảng không cung cấp lượt xem'}><Eye className="inline h-3 w-3" /> {video.views ? compact.format(video.views) : '—'}</span>
                     <span><Heart className="inline h-3 w-3" /> {compact.format(video.likes)}</span>
                     <span><MessageCircle className="inline h-3 w-3" /> {compact.format(video.comments)}</span>
@@ -301,15 +362,15 @@ export function VideoResults() {
               <Select value={mood} onValueChange={setMood}>
                 <SelectTrigger className="h-8 w-44 text-xs"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="natural">Tự nhiên, rõ lời</SelectItem>
-                  <SelectItem value="energetic">Năng lượng, vui vẻ</SelectItem>
+                  <SelectItem value="natural">Tự nhiên, có nhịp nghỉ</SelectItem>
+                  <SelectItem value="energetic">Tươi hơn, không quá nhanh</SelectItem>
                   <SelectItem value="warm">Ấm áp, chậm rãi</SelectItem>
                 </SelectContent>
               </Select>
               <Button size="sm" onClick={renderDubbing} disabled={dubbing || !transcript.trim()}>
                 <Languages className="h-4 w-4" /> {dubbing ? 'Đang dịch và ghép...' : 'Transcript đúng — tiến hành lồng tiếng'}
               </Button>
-              {dubOutput && <a href={dubOutput} className="text-xs text-cyber-neon-cyan underline">Tải output_vi.mp4</a>}
+              {dubOutput && <a href={withWorkspace(dubOutput)} className="text-xs text-cyber-neon-cyan underline">Tải output_vi.mp4</a>}
               {(dubbing || dubError) && (
                 <div className={`w-full rounded border p-3 ${dubError ? 'border-red-400/50 bg-red-950/20' : 'border-cyber-neon-cyan/50 bg-black/40'}`} aria-live="polite">
                   <div className="mb-2 flex items-center gap-2 text-xs">

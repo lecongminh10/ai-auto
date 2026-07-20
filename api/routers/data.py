@@ -19,18 +19,16 @@
 import os
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/data", tags=["data"])
-
-# Data directory
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
+from ..workspace import get_workspace_id, workspace_data_dir
 
 
-def get_file_info(file_path: Path) -> dict:
+def get_file_info(file_path: Path, data_dir: Path) -> dict:
     """Get file information"""
     stat = file_path.stat()
     record_count = None
@@ -50,7 +48,7 @@ def get_file_info(file_path: Path) -> dict:
 
     return {
         "name": file_path.name,
-        "path": str(file_path.relative_to(DATA_DIR)),
+        "path": str(file_path.relative_to(data_dir)),
         "size": stat.st_size,
         "modified_at": stat.st_mtime,
         "record_count": record_count,
@@ -59,15 +57,20 @@ def get_file_info(file_path: Path) -> dict:
 
 
 @router.get("/files")
-async def list_data_files(platform: Optional[str] = None, file_type: Optional[str] = None):
+async def list_data_files(
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+    platform: Optional[str] = None,
+    file_type: Optional[str] = None,
+):
     """Get data file list"""
-    if not DATA_DIR.exists():
+    data_dir = workspace_data_dir(workspace_id)
+    if not data_dir.exists():
         return {"files": []}
 
     files = []
     supported_extensions = {".json", ".csv", ".xlsx", ".xls"}
 
-    for root, dirs, filenames in os.walk(DATA_DIR):
+    for root, dirs, filenames in os.walk(data_dir):
         root_path = Path(root)
         for filename in filenames:
             file_path = root_path / filename
@@ -76,7 +79,7 @@ async def list_data_files(platform: Optional[str] = None, file_type: Optional[st
 
             # Platform filter
             if platform:
-                rel_path = str(file_path.relative_to(DATA_DIR))
+                rel_path = str(file_path.relative_to(data_dir))
                 if platform.lower() not in rel_path.lower():
                     continue
 
@@ -85,7 +88,7 @@ async def list_data_files(platform: Optional[str] = None, file_type: Optional[st
                 continue
 
             try:
-                files.append(get_file_info(file_path))
+                files.append(get_file_info(file_path, data_dir))
             except Exception:
                 continue
 
@@ -96,9 +99,15 @@ async def list_data_files(platform: Optional[str] = None, file_type: Optional[st
 
 
 @router.get("/files/{file_path:path}")
-async def get_file_content(file_path: str, preview: bool = True, limit: int = 100):
+async def get_file_content(
+    file_path: str,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+    preview: bool = True,
+    limit: int = 100,
+):
     """Get file content or preview"""
-    full_path = DATA_DIR / file_path
+    data_dir = workspace_data_dir(workspace_id)
+    full_path = data_dir / file_path
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -108,7 +117,7 @@ async def get_file_content(file_path: str, preview: bool = True, limit: int = 10
 
     # Security check: ensure within DATA_DIR
     try:
-        full_path.resolve().relative_to(DATA_DIR.resolve())
+        full_path.resolve().relative_to(data_dir.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -164,9 +173,13 @@ async def get_file_content(file_path: str, preview: bool = True, limit: int = 10
 
 
 @router.get("/download/{file_path:path}")
-async def download_file(file_path: str):
+async def download_file(
+    file_path: str,
+    workspace_id: Annotated[str, Depends(get_workspace_id)],
+):
     """Download file"""
-    full_path = DATA_DIR / file_path
+    data_dir = workspace_data_dir(workspace_id)
+    full_path = data_dir / file_path
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -176,7 +189,7 @@ async def download_file(file_path: str):
 
     # Security check
     try:
-        full_path.resolve().relative_to(DATA_DIR.resolve())
+        full_path.resolve().relative_to(data_dir.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -188,9 +201,10 @@ async def download_file(file_path: str):
 
 
 @router.get("/stats")
-async def get_data_stats():
+async def get_data_stats(workspace_id: Annotated[str, Depends(get_workspace_id)]):
     """Get data statistics"""
-    if not DATA_DIR.exists():
+    data_dir = workspace_data_dir(workspace_id)
+    if not data_dir.exists():
         return {"total_files": 0, "total_size": 0, "by_platform": {}, "by_type": {}}
 
     stats = {
@@ -202,7 +216,7 @@ async def get_data_stats():
 
     supported_extensions = {".json", ".csv", ".xlsx", ".xls"}
 
-    for root, dirs, filenames in os.walk(DATA_DIR):
+    for root, dirs, filenames in os.walk(data_dir):
         root_path = Path(root)
         for filename in filenames:
             file_path = root_path / filename
@@ -219,7 +233,7 @@ async def get_data_stats():
                 stats["by_type"][file_type] = stats["by_type"].get(file_type, 0) + 1
 
                 # Statistics by platform (inferred from path)
-                rel_path = str(file_path.relative_to(DATA_DIR))
+                rel_path = str(file_path.relative_to(data_dir))
                 for platform in ["xhs", "dy", "ks", "bili", "wb", "tieba", "zhihu"]:
                     if platform in rel_path.lower():
                         stats["by_platform"][platform] = stats["by_platform"].get(platform, 0) + 1
