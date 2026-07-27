@@ -276,7 +276,7 @@ export function VideoResults() {
         </Button>
       </header>
 
-      <div className="max-h-[300px] overflow-auto p-3 pb-8">
+      <div className="max-h-[520px] overflow-auto p-3 pb-8">
         {videos.length === 0 ? (
           <p className="py-8 text-center text-xs text-cyber-text-muted">
             {status === 'idle' && Number(filters.minDuration) > 0
@@ -284,7 +284,7 @@ export function VideoResults() {
               : 'Hãy crawl theo từ khóa, sau đó kết quả sẽ xuất hiện tại đây để lọc và xem trước.'}
           </p>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {videos.map((video) => (
               <article key={video.id} className={`rounded-md border overflow-hidden bg-cyber-bg-tertiary/40 ${selected.has(video.id) ? 'border-cyber-neon-cyan' : 'border-cyber-border-subtle'}`}>
                 <div className="relative aspect-video bg-black">
@@ -294,7 +294,7 @@ export function VideoResults() {
                       preload="none"
                       poster={video.cover_url}
                       src={withWorkspace(`/api/videos/stream?platform=${video.platform}&video_id=${encodeURIComponent(video.id)}`)}
-                      className="h-full w-full object-contain"
+                      className="h-full w-full object-cover"
                     />
                   ) : video.cover_url ? (
                     <img src={video.cover_url} alt="" className="h-full w-full object-cover" />
