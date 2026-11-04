@@ -51,12 +51,14 @@ const defaultConfig: CrawlerConfig = {
   login_type: 'qrcode',
   crawler_type: 'search',
   keywords: '',
+  creator_ids: '',
   start_page: 1,
   enable_comments: false,
   enable_sub_comments: false,
   save_option: 'jsonl',
   cookies: '',
   headless: false,
+  max_notes_count: 300,
   min_video_duration_seconds: 0,
 }
 

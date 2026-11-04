@@ -14,10 +14,10 @@ _key_cursor = 0
 # Các semaphore phải dùng chung ở cấp process. Nếu tạo bên trong từng job thì
 # tổng số request vẫn tăng theo số người dùng và nhanh chóng chạm rate-limit.
 _SUBTITLE_TRANSLATION_SEMAPHORE = asyncio.Semaphore(
-    max(1, int(os.getenv("TRANSLATION_GLOBAL_PARALLELISM", "1")))
+    max(1, int(os.getenv("TRANSLATION_GLOBAL_PARALLELISM", "2")))
 )
 _GOOGLE_TRANSLATE_SEMAPHORE = asyncio.Semaphore(
-    max(1, int(os.getenv("GOOGLE_TRANSLATE_GLOBAL_PARALLELISM", "1")))
+    max(1, int(os.getenv("GOOGLE_TRANSLATE_GLOBAL_PARALLELISM", "3")))
 )
 
 
@@ -64,18 +64,19 @@ async def _translate_with_google_fallback_unlimited(lines: list[str]) -> list[st
             for attempt in range(max_attempts):
                 endpoint = endpoints[attempt % len(endpoints)]
                 try:
-                    response = await client.get(
-                        endpoint,
-                        params={
-                            "client": "gtx",
-                            # Whisper may keep short Japanese/Korean phrases
-                            # inside otherwise Chinese videos.
-                            "sl": "auto",
-                            "tl": "vi",
-                            "dt": "t",
-                            "q": line,
-                        },
-                    )
+                    async with _GOOGLE_TRANSLATE_SEMAPHORE:
+                        response = await client.get(
+                            endpoint,
+                            params={
+                                "client": "gtx",
+                                # Whisper may keep short Japanese/Korean phrases
+                                # inside otherwise Chinese videos.
+                                "sl": "auto",
+                                "tl": "vi",
+                                "dt": "t",
+                                "q": line,
+                            },
+                        )
                     response.raise_for_status()
                     payload = response.json()
                     value = "".join(part[0] for part in payload[0] if part and part[0]).strip()
@@ -109,9 +110,8 @@ async def _translate_with_google_fallback_unlimited(lines: list[str]) -> list[st
 
 
 async def _translate_with_google_fallback(lines: list[str]) -> list[str]:
-    """Xếp các batch Google Translate vào hàng đợi chung của server."""
-    async with _GOOGLE_TRANSLATE_SEMAPHORE:
-        return await _translate_with_google_fallback_unlimited(lines)
+    """Giới hạn request Google toàn server nhưng cho các video dịch xen kẽ."""
+    return await _translate_with_google_fallback_unlimited(lines)
 
 
 async def expand_vietnamese_keywords(keywords: list[str]) -> list[str]:
@@ -157,6 +157,7 @@ async def _translate_chinese_subtitles_unlimited(
     lines: list[str],
     on_status: Callable[[str], Awaitable[None]] | None = None,
     durations_ms: list[int] | None = None,
+    style: str = "faithful",
 ) -> list[str]:
     """Dịch phụ đề theo ánh xạ 1-1, ưu tiên câu Việt ngắn và dễ lồng tiếng."""
     keys = _rotated_keys()
@@ -164,26 +165,59 @@ async def _translate_chinese_subtitles_unlimited(
         raise RuntimeError("Gemini chưa được cấu hình; hãy thêm GEMINI_API_KEYS vào .env")
     if durations_ms is None or len(durations_ms) != len(lines):
         durations_ms = [0] * len(lines)
+    strict_one_to_one = style == "faithful"
     entries = [
         {
+            "id": index,
             "text": line,
             "duration_ms": duration,
             # Giọng Việt tự nhiên trong video ngắn thường dễ nghe ở khoảng
             # 3 từ/giây. Giữ câu thoáng hơn để TTS không phải đọc gấp.
-            "max_vietnamese_words": max(2, round(duration / 320)) if duration else None,
+            "max_vietnamese_words": max(
+                2,
+                round(duration / (330 if strict_one_to_one else 280)),
+            ) if duration else None,
         }
-        for line, duration in zip(lines, durations_ms)
+        for index, (line, duration) in enumerate(zip(lines, durations_ms), 1)
     ]
+    style_instruction = {
+        "faithful": (
+            "Chế độ SÁT NGHĨA 1-1: mỗi phần tử đầu vào phải tạo đúng một phần tử đầu ra. "
+            "Giữ nguyên đầy đủ sự kiện, con số, tên riêng, quan hệ nguyên nhân-kết quả, mức độ "
+            "khẳng định và sắc thái của chính câu đó. Không gộp câu, không tách câu, không chuyển "
+            "ý sang câu bên cạnh, không thêm giải thích, không suy diễn và không lược bỏ ý. Chỉ "
+            "rút gọn cách diễn đạt tiếng Việt bằng từ đồng nghĩa ngắn hơn để vừa thời lượng."
+        ),
+        "conversational": (
+            "Phong cách: lời nói đời thường, tự nhiên, gọn và dễ nghe. "
+            "Dùng cách xưng hô trung tính, tránh văn viết."
+        ),
+        "narration": (
+            "Phong cách: thuyết minh mượt, rõ nghĩa, câu văn tròn hơn nhưng vẫn ngắn. "
+            "Phù hợp video kiến thức, kể chuyện, giải thích."
+        ),
+        "review": (
+            "Phong cách: review/video mạng xã hội, có năng lượng vừa phải, câu nói bắt tai "
+            "nhưng không lố, không thêm cảm xúc ngoài nội dung gốc."
+        ),
+    }.get(style, "Phong cách: lời nói đời thường, tự nhiên, gọn và dễ nghe.")
+    recognition_instruction = (
+        "Không tự sửa, bổ sung hoặc đoán phần lời nguồn; dịch đúng nội dung text được cung cấp."
+        if strict_one_to_one else
+        "Có thể sửa hợp lý lỗi nhận dạng nhỏ nếu ngữ cảnh cho thấy rõ, nhưng không bịa thông tin."
+    )
     prompt = f"""Bạn là biên dịch viên và biên tập lời thoại lồng tiếng chuyên nghiệp.
 Hãy đọc toàn bộ nhóm câu để hiểu ngữ cảnh rồi chuyển từng câu sang tiếng Việt tự nhiên,
 trôi chảy như người Việt đang nói ngoài đời; không dịch máy từng chữ. Ưu tiên câu
 ngắn, thân mật, có nhịp nghỉ bằng dấu phẩy/dấu chấm khi cần để giọng đọc không bị
-liền tù tì. Giữ nhất quán chủ ngữ, đại từ, tên riêng và thuật ngữ giữa các câu. Sửa
-hợp lý lỗi nhận dạng nhỏ nếu ngữ cảnh cho thấy rõ, nhưng không bịa thêm thông tin.
+liền tù tì. Giữ nhất quán chủ ngữ, đại từ, tên riêng và thuật ngữ giữa các câu.
+{recognition_instruction}
+{style_instruction}
 
 Mỗi câu phải súc tích và không vượt quá max_vietnamese_words, ưu tiên diễn đạt lại
-ngắn hơn thay vì làm giọng đọc chạy nhanh. Tránh văn viết cứng như "do đó", "tuy
-nhiên" nếu có thể nói tự nhiên hơn. Chỉ dùng chữ tiếng Việt/Latin, chữ số và dấu câu
+ngắn hơn thay vì làm giọng đọc chạy nhanh, nhưng không được cụt ý hoặc nghe như
+dịch từng mảnh. Tránh văn viết cứng như "do đó", "tuy nhiên" nếu có thể nói tự
+nhiên hơn. Chỉ dùng chữ tiếng Việt/Latin, chữ số và dấu câu
 thông thường. Với đầu vào chỉ là tiếng đệm thì dùng tiếng đệm Việt tự nhiên; với đầu
 vào vô nghĩa hoặc chỉ có ký hiệu thì trả một dấu chấm để giữ khoảng lặng.
 
@@ -254,9 +288,10 @@ async def translate_chinese_subtitles(
     lines: list[str],
     on_status: Callable[[str], Awaitable[None]] | None = None,
     durations_ms: list[int] | None = None,
+    style: str = "faithful",
 ) -> list[str]:
     """Dịch phụ đề qua hàng đợi chung để nhiều job không dội request vào API."""
     if _SUBTITLE_TRANSLATION_SEMAPHORE.locked() and on_status:
         await on_status("Đang chờ lượt dịch; server đang xử lý một video khác...")
     async with _SUBTITLE_TRANSLATION_SEMAPHORE:
-        return await _translate_chinese_subtitles_unlimited(lines, on_status, durations_ms)
+        return await _translate_chinese_subtitles_unlimited(lines, on_status, durations_ms, style)

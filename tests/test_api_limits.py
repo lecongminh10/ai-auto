@@ -70,6 +70,26 @@ def test_crawler_manager_build_command():
     idx_duration = cmd2.index("--min_video_duration_seconds")
     assert cmd2[idx_duration + 1] == "900"
 
+
+def test_crawler_manager_restores_previous_results_when_new_crawl_has_no_results(tmp_path):
+    workspace = tmp_path / "workspace"
+    data_dir = workspace / "data" / "douyin" / "jsonl"
+    data_dir.mkdir(parents=True)
+    result_file = data_dir / "search_contents_2026-07-27.jsonl"
+    result_file.write_text('{"aweme_id":"old-video"}\n', encoding="utf-8")
+
+    cm = CrawlerManager(workspace_root=workspace)
+    platform_data_dir = cm._platform_data_dir("dy")
+    backup_dir = cm._stash_search_results(platform_data_dir)
+
+    assert not result_file.exists()
+    assert backup_dir is not None
+
+    restored = cm._restore_search_results(platform_data_dir, backup_dir)
+
+    assert restored is True
+    assert result_file.read_text(encoding="utf-8") == '{"aweme_id":"old-video"}\n'
+
 def test_api_start_crawler_with_limits():
     client = TestClient(app)
 

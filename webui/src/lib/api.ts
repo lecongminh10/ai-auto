@@ -16,12 +16,15 @@ export interface CrawlerConfig {
   login_type: string
   crawler_type: string
   keywords: string
+  creator_ids: string
   start_page: number
   enable_comments: boolean
   enable_sub_comments: boolean
   save_option: string
   cookies: string
   headless: boolean
+  max_notes_count: number
+  min_video_duration_seconds: number
 }
 
 export interface CrawlerStatus {

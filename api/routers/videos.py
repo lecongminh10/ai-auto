@@ -13,7 +13,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..services.gemini_service import expand_vietnamese_keywords, is_configured
-from ..services.dubbing_service import dub, parse_srt, transcribe
+from ..services.dubbing_service import (
+    _GLOBAL_DOWNLOAD_SEMAPHORE,
+    dub,
+    parse_srt,
+    transcribe,
+    whisper_runtime_settings,
+)
 from ..services.media_social_service import handoff
 from ..workspace import get_workspace_id, workspace_data_dir, workspace_root, workspace_video_dir
 
@@ -111,17 +117,26 @@ def _cached_transcript(work_dir: Path) -> str | None:
     return transcript
 
 
-def _read_records(platform: str, workspace_id: str = "default") -> list[dict]:
+def _read_records(
+    platform: str,
+    workspace_id: str = "default",
+    staged_backup_dir: Path | None = None,
+) -> list[dict]:
     platform_dir = workspace_data_dir(workspace_id) / ({"dy": "douyin", "bili": "bilibili"}.get(platform, platform))
     records: list[dict] = []
-    if not platform_dir.exists():
-        return records
-    files = sorted(
-        [p for p in platform_dir.rglob("search_contents_*") if p.suffix in {".json", ".jsonl"}],
+    files = [
+            p
+            for pattern in ("search_contents_*", "creator_contents_*")
+            for base_dir in (platform_dir, staged_backup_dir)
+            if base_dir and base_dir.exists()
+            for p in base_dir.rglob(pattern)
+            if p.suffix in {".json", ".jsonl"}
+        ]
+    files.sort(
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    for path in files[:3]:
+    for path in files:
         try:
             if path.suffix == ".jsonl":
                 records.extend(json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip())
@@ -148,6 +163,9 @@ def _normalize(platform: str, item: dict) -> dict:
     return {
         "id": video_id,
         "platform": platform,
+        # A stable anonymous group key lets the UI show one creator's videos
+        # without exposing or persisting the platform's raw account ID.
+        "creator_hash": str(item.get("creator_hash") or ""),
         "title": item.get("title") or item.get("desc") or "Video không có tiêu đề",
         "author": item.get("nickname") or "",
         "source_keyword": item.get("source_keyword") or "",
@@ -162,6 +180,9 @@ def _normalize(platform: str, item: dict) -> dict:
         "shares": _number(item.get("share_count") or item.get("video_share_count")),
         "collections": _number(item.get("collected_count") or item.get("video_favorite_count")),
         "duration_seconds": _number(item.get("duration_seconds")),
+        "published_at": _number(
+            item.get("create_time") or item.get("pubdate") or item.get("publish_time")
+        ),
     }
 
 
@@ -225,17 +246,27 @@ async def list_videos(
     platform: Literal["dy", "xhs", "bili"],
     workspace_id: Annotated[str, Depends(get_workspace_id)],
     keyword: str = "",
+    creator_hash: str = "",
     min_views: int = Query(0, ge=0),
     min_likes: int = Query(0, ge=0),
     min_comments: int = Query(0, ge=0),
     min_shares: int = Query(0, ge=0),
     min_duration_seconds: int = Query(0, ge=0),
-    sort_by: Literal["views", "likes", "comments", "shares", "collections"] = "views",
+    sort_by: Literal["newest", "views", "likes", "comments", "shares", "collections"] = "newest",
 ):
+    staged_backup_dir = None
+    if creator_hash:
+        from ..services import crawler_manager, get_crawler_manager
+
+        manager = crawler_manager if workspace_id == "default" else get_crawler_manager(workspace_id)
+        staged_backup_dir = manager.staged_creator_results(platform)
+
     seen: set[str] = set()
     videos = []
-    for raw in _read_records(platform, workspace_id):
+    for raw in _read_records(platform, workspace_id, staged_backup_dir):
         video = _normalize(platform, raw)
+        if creator_hash and video["creator_hash"] != creator_hash:
+            continue
         if not video["id"] or video["id"] in seen:
             continue
         seen.add(video["id"])
@@ -252,8 +283,16 @@ async def list_videos(
             continue
         if platform in {"dy", "bili"} and min_duration_seconds and video["duration_seconds"] <= min_duration_seconds:
             continue
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", video["id"])
+        video["dubbed_available"] = bool(
+            platform == "dy"
+            and (workspace_video_dir(workspace_id) / "dy" / safe_id / "output_vi.mp4").is_file()
+        )
         videos.append(video)
-    videos.sort(key=lambda value: value[sort_by], reverse=True)
+    if sort_by == "newest":
+        videos.sort(key=lambda value: value["published_at"], reverse=True)
+    else:
+        videos.sort(key=lambda value: value[sort_by], reverse=True)
     return {"videos": videos, "total": len(videos)}
 
 
@@ -276,6 +315,7 @@ class DubbingRenderRequest(BaseModel):
     transcript_srt: str
     voice: Literal["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"] = "vi-VN-HoaiMyNeural"
     mood: Literal["natural", "energetic", "warm"] = "natural"
+    translation_style: Literal["faithful", "conversational", "narration", "review"] = "faithful"
 
 
 class SocialSendRequest(BaseModel):
@@ -353,12 +393,13 @@ async def download_video(
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / "video.mp4"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
-            async with client.stream("GET", request.url, headers={"User-Agent": "Mozilla/5.0"}) as response:
-                response.raise_for_status()
-                with target.open("wb") as output:
-                    async for chunk in response.aiter_bytes():
-                        output.write(chunk)
+        async with _GLOBAL_DOWNLOAD_SEMAPHORE:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+                async with client.stream("GET", request.url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+                    response.raise_for_status()
+                    with target.open("wb") as output:
+                        async for chunk in response.aiter_bytes():
+                            output.write(chunk)
     except httpx.HTTPError as exc:
         target.unlink(missing_ok=True)
         raise HTTPException(502, f"Không thể tải video: {exc}") from exc
@@ -396,16 +437,37 @@ async def _prepare_dubbing_job(job_id: str, request: DubbingPrepareRequest, work
             return
         await _download_dubbing_video(request, work_dir, job)
         _update_dub_job(job, stage="Đã tải xong. Đang tách audio WAV 16 kHz...", progress=30)
-        _update_dub_job(job, stage="Đang chạy Whisper model small nhận diện tiếng Trung (lần đầu có thể tải model)...", progress=40)
+        whisper_settings = whisper_runtime_settings()
+        _update_dub_job(
+            job,
+            stage=(
+                f"Đang chạy Whisper model {whisper_settings['model']} "
+                f"trên {whisper_settings['device']} nhận diện tiếng Trung..."
+            ),
+            progress=40,
+        )
         async def whisper_progress(done: int, total: int):
-            _update_dub_job(job, stage=f"Whisper đang xử lý đoạn {done}/{total} (tối đa 3 đoạn song song)...", progress=40 + int(done / total * 55))
+            _update_dub_job(
+                job,
+                stage=(
+                    f"Whisper đang xử lý đoạn {done}/{total} "
+                    f"(tối đa {whisper_settings['parallelism']} đoạn song song, "
+                    f"mỗi đoạn {whisper_settings['chunk_seconds']}s)..."
+                ),
+                progress=40 + int(done / total * 55),
+            )
         transcript = await transcribe(work_dir / "video.mp4", work_dir, whisper_progress)
         _update_dub_job(job, status="done", stage="Đã nhận diện xong transcript.", progress=100, transcript_srt=transcript)
-    except (RuntimeError, ValueError, OSError) as exc:
+    except Exception as exc:
         _update_dub_job(job, status="error", stage="Pipeline dừng do lỗi.", error=str(exc))
 
 
 async def _download_dubbing_video(request: DubbingPrepareRequest, work_dir: Path, job: dict):
+    async with _GLOBAL_DOWNLOAD_SEMAPHORE:
+        await _download_dubbing_video_with_slot(request, work_dir, job)
+
+
+async def _download_dubbing_video_with_slot(request: DubbingPrepareRequest, work_dir: Path, job: dict):
     parsed = urlparse(request.url)
     if parsed.scheme not in {"http", "https"} or not (parsed.hostname and parsed.hostname.endswith("douyin.com")):
         raise ValueError("URL video Douyin không hợp lệ hoặc đã hết hạn")
@@ -554,7 +616,13 @@ async def _render_dubbing_job(
 
     try:
         await dub(
-            video_path, work_dir, request.transcript_srt, request.voice, request.mood, progress
+            video_path,
+            work_dir,
+            request.transcript_srt,
+            request.voice,
+            request.mood,
+            request.translation_style,
+            progress,
         )
         handoff.start(
             work_dir / "output_vi.mp4",
@@ -571,7 +639,7 @@ async def _render_dubbing_job(
             progress=100,
             output_url=f"/api/videos/dub/output/{request.video_id}",
         )
-    except (RuntimeError, ValueError, OSError) as exc:
+    except Exception as exc:
         _append_job_log(job, f"LỖI: {exc}")
         _update_dub_job(job, status="error", stage="Pipeline lồng tiếng dừng do lỗi.", error=str(exc))
     finally:
@@ -589,7 +657,12 @@ async def get_dubbed_video(
         raise HTTPException(404, "Video lồng tiếng chưa được tạo")
     # Không dọn file trung gian tại đây: trình duyệt có thể mở link output cũ
     # trong khi một job retry đang dùng các file TTS/cache cùng thư mục.
-    return FileResponse(output, media_type="video/mp4", filename=f"{safe_id}_vi.mp4")
+    return FileResponse(
+        output,
+        media_type="video/mp4",
+        filename=f"{safe_id}_vi.mp4",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @router.post("/social/send")

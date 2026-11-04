@@ -34,6 +34,56 @@ def test_video_results_are_isolated_by_workspace(tmp_path, monkeypatch):
     assert [item["id"] for item in response_b.json()["videos"]] == ["video-b"]
 
 
+def test_downloaded_videos_remain_visible_in_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp_path)
+    data_dir = workspace.workspace_data_dir(WORKSPACE_A) / "douyin" / "jsonl"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "search_contents_test.jsonl").write_text(
+        "\n".join([
+            json.dumps({"aweme_id": "downloaded-video", "desc": "Downloaded"}),
+            json.dumps({"aweme_id": "new-video", "desc": "New"}),
+        ]) + "\n",
+        "utf-8",
+    )
+    downloaded = workspace.workspace_video_dir(WORKSPACE_A) / "dy" / "downloaded-video" / "video.mp4"
+    downloaded.parent.mkdir(parents=True, exist_ok=True)
+    downloaded.write_bytes(b"video")
+
+    response = TestClient(app).get(
+        "/api/videos",
+        params={"platform": "dy"},
+        headers=_headers(WORKSPACE_A),
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["videos"]] == [
+        "downloaded-video",
+        "new-video",
+    ]
+
+
+def test_dubbed_videos_remain_visible_in_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp_path)
+    data_dir = workspace.workspace_data_dir(WORKSPACE_A) / "douyin" / "jsonl"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "search_contents_test.jsonl").write_text(
+        json.dumps({"aweme_id": "dubbed-video", "desc": "Dubbed"}) + "\n",
+        "utf-8",
+    )
+    output = workspace.workspace_video_dir(WORKSPACE_A) / "dy" / "dubbed-video" / "output_vi.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"dubbed-video")
+
+    response = TestClient(app).get(
+        "/api/videos",
+        params={"platform": "dy"},
+        headers=_headers(WORKSPACE_A),
+    )
+
+    assert response.status_code == 200
+    assert [video["id"] for video in response.json()["videos"]] == ["dubbed-video"]
+
+
 def test_dubbing_job_cannot_be_read_from_another_workspace():
     job_id = "isolated-job"
     videos._DUB_JOBS[job_id] = {
@@ -89,6 +139,7 @@ def test_dubbed_file_cannot_be_downloaded_from_another_workspace(tmp_path, monke
 
     assert own.status_code == 200
     assert own.content == b"private-video"
+    assert own.headers["cache-control"] == "no-store, no-cache, must-revalidate"
     assert other.status_code == 404
 
 

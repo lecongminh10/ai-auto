@@ -150,9 +150,9 @@ def parse_creator_info_from_url(url: str) -> CreatorUrlInfo:
     Returns:
         CreatorUrlInfo: Object containing creator ID
     """
-    # If it's a pure ID format (usually starts with MS4wLjABAAAA), return directly
-    if url.startswith("MS4wLjABAAAA") or (not url.startswith("http") and "douyin.com" not in url):
-        return CreatorUrlInfo(sec_user_id=url)
+    url = url.strip()
+    if not url:
+        raise ValueError("Creator URL or ID is empty")
 
     # Extract sec_user_id from creator homepage URL: /user/xxx
     user_pattern = r'/user/([^/?]+)'
@@ -160,6 +160,11 @@ def parse_creator_info_from_url(url: str) -> CreatorUrlInfo:
     if match:
         sec_user_id = match.group(1)
         return CreatorUrlInfo(sec_user_id=sec_user_id)
+
+    # Accept a raw sec_user_id, but don't silently treat arbitrary URLs (such
+    # as share links) as IDs. Short links are resolved by the crawler first.
+    if not re.match(r"https?://", url, re.IGNORECASE) and "/" not in url and "," not in url:
+        return CreatorUrlInfo(sec_user_id=url)
 
     raise ValueError(f"Unable to parse creator ID from URL: {url}")
 

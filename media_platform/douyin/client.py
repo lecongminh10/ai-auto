@@ -39,6 +39,8 @@ from .exception import *
 from .field import *
 from .help import *
 
+DOUYIN_ARGUS_HEADER_VALUE = "1"
+
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
@@ -55,6 +57,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         self.proxy = proxy
         self.timeout = timeout
         self.headers = headers
+        self.headers.setdefault("x-tt-argus", DOUYIN_ARGUS_HEADER_VALUE)
         self._host = "https://www.douyin.com"
         self.cookie_urls = [
             "https://douyin.com",
@@ -65,8 +68,17 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
+        self._update_security_headers()
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
+
+    def _update_security_headers(self) -> None:
+        """Keep the web risk-control headers in sync with the browser session."""
+        uifid = self.cookie_dict.get("UIFID") or self.cookie_dict.get("UIFID_TEMP")
+        if uifid:
+            self.headers["uifid"] = uifid
+        else:
+            self.headers.pop("uifid", None)
 
     async def __process_req_params(
         self,
@@ -126,13 +138,23 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
+        if response.text == "" or response.text == "blocked":
+            utils.logger.error(f"request params incorrect, response.text: {response.text}")
+            raise DataFetchError("Douyin returned an empty or blocked response")
+        if response.status_code >= 400:
+            error_body = response.text[:500]
+            if "Uifid Not Found" in error_body:
+                raise DataFetchError(
+                    "Douyin rejected this request because the browser session has no UIFID. "
+                    "Refresh the Douyin login session and try again."
+                )
+            raise DataFetchError(f"Douyin HTTP {response.status_code}: {error_body}")
         try:
-            if response.text == "" or response.text == "blocked":
-                utils.logger.error(f"request params incrr, response.text: {response.text}")
-                raise Exception("account blocked")
             return response.json()
-        except Exception as e:
-            raise DataFetchError(f"{e}, {response.text}")
+        except ValueError as exc:
+            raise DataFetchError(
+                f"Douyin returned non-JSON content (HTTP {response.status_code}): {response.text[:500]}"
+            ) from exc
 
     async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
         """
@@ -165,6 +187,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         )
         self.headers["Cookie"] = cookie_str
         self.cookie_dict = cookie_dict
+        self._update_security_headers()
 
     async def search_info_by_keyword(
         self,
@@ -329,7 +352,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         }
         return await self.get(uri, params)
 
-    async def get_all_user_aweme_posts(self, sec_user_id: str, callback: Optional[Callable] = None):
+    async def get_all_user_aweme_posts(
+        self,
+        sec_user_id: str,
+        callback: Optional[Callable] = None,
+        max_count: Optional[int] = None,
+    ):
         posts_has_more = 1
         max_cursor = ""
         result = []
@@ -338,10 +366,17 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             posts_has_more = aweme_post_res.get("has_more", 0)
             max_cursor = aweme_post_res.get("max_cursor")
             aweme_list = aweme_post_res.get("aweme_list") if aweme_post_res.get("aweme_list") else []
+            if max_count is not None:
+                remaining = max_count - len(result)
+                if remaining <= 0:
+                    break
+                aweme_list = aweme_list[:remaining]
             utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] get sec_user_id:{sec_user_id} video len : {len(aweme_list)}")
             if callback:
                 await callback(aweme_list)
             result.extend(aweme_list)
+            if max_count is not None and len(result) >= max_count:
+                break
         return result
 
     async def get_aweme_media(self, url: str) -> Union[bytes, None]:

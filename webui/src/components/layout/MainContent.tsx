@@ -6,7 +6,7 @@ export function MainContent() {
   useLogWebSocket()
 
   return (
-    <main className="flex-1 flex flex-col overflow-hidden min-h-0 relative z-10">
+    <main className="relative z-10 h-80 min-h-0 overflow-hidden">
       <Terminal />
     </main>
   )

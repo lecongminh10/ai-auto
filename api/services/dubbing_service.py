@@ -1,9 +1,11 @@
 import asyncio
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
+import sys
 import unicodedata
 import wave
 from dataclasses import dataclass
@@ -28,6 +30,9 @@ TIME_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})")
 # rate-limit. Semaphore riêng của mỗi job bên dưới vẫn giữ fairness nội bộ.
 _GLOBAL_WHISPER_SEMAPHORE = asyncio.Semaphore(
     max(1, int(os.getenv("WHISPER_GLOBAL_PARALLELISM", os.getenv("WHISPER_PARALLELISM", "3"))))
+)
+_GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.getenv("VIDEO_DOWNLOAD_PARALLELISM", "4")))
 )
 _GLOBAL_TTS_SEMAPHORE = asyncio.Semaphore(
     max(1, int(os.getenv("TTS_GLOBAL_PARALLELISM", os.getenv("TTS_PARALLELISM", "4"))))
@@ -127,13 +132,25 @@ async def _run(*args: str) -> None:
 
 
 def check_tools() -> None:
-    missing = [name for name in ("ffmpeg", "ffprobe", "whisper") if not shutil.which(name)]
+    missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
+    if not shutil.which("whisper") and importlib.util.find_spec("whisper") is None:
+        missing.append("whisper")
     if missing:
         raise RuntimeError(f"Thiếu công cụ: {', '.join(missing)}")
     try:
         import edge_tts  # noqa: F401
     except ImportError as exc:
         raise RuntimeError("Thiếu edge-tts; chạy uv sync để cài dependencies") from exc
+
+
+def _whisper_command() -> list[str]:
+    """Dùng CLI nếu có trong PATH, nếu không thì chạy package của Python hiện tại."""
+    executable = shutil.which("whisper")
+    if executable:
+        return [executable]
+    if importlib.util.find_spec("whisper") is not None:
+        return [sys.executable, "-m", "whisper"]
+    raise RuntimeError("Thiếu công cụ whisper; cài dependency bằng `uv sync`")
 
 
 async def _audio_duration_ms(path: Path) -> int:
@@ -186,22 +203,52 @@ def cleanup_media_intermediates(work_dir: Path, output: Path) -> None:
 async def transcribe(video_path: Path, work_dir: Path, on_progress: Callable[[int, int], Awaitable[None]] | None = None) -> str:
     check_tools()
     audio = work_dir / "audio.wav"
-    await _run("ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(audio))
-    # Whisper CLI mặc định chỉ chọn CUDA/CPU và bỏ qua Apple MPS. MPS nhanh
-    # hơn đáng kể trên Mac Apple Silicon; máy không có MPS vẫn dùng CPU.
-    device = "cpu"
+    extract_args = ("-i", str(video_path), "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(audio))
     try:
-        import torch
-        if torch.backends.mps.is_available():
-            device = "mps"
-    except (ImportError, AttributeError):
-        pass
+        await _run("ffmpeg", "-y", *extract_args)
+    except RuntimeError as strict_error:
+        # Một số video Douyin chứa packet AAC hỏng nhưng vẫn còn phần lời thoại
+        # giải mã được. Thử bỏ qua packet lỗi để Whisper có thể nhận diện phần còn lại.
+        audio.unlink(missing_ok=True)
+        try:
+            await _run(
+                "ffmpeg", "-y", "-fflags", "+discardcorrupt", "-err_detect", "ignore_err",
+                *extract_args,
+            )
+        except RuntimeError as tolerant_error:
+            raise RuntimeError(
+                "Không thể đọc âm thanh AAC của video (dữ liệu âm thanh có thể bị hỏng). "
+                "FFmpeg đã thử bỏ qua packet lỗi nhưng vẫn thất bại. Hãy tải lại video hoặc bỏ video này khỏi lô."
+            ) from tolerant_error
+        if not audio.is_file() or audio.stat().st_size <= 44:
+            raise RuntimeError(
+                "Luồng âm thanh AAC của video bị lỗi và không còn dữ liệu để nhận diện lời thoại. "
+                "Hãy tải lại video hoặc bỏ video này khỏi lô."
+            ) from strict_error
+    # Whisper CLI không tự chọn Apple MPS trong nhiều môi trường. Cho phép ép
+    # qua env, còn mặc định ưu tiên MPS trên Mac Apple Silicon rồi mới tới CPU.
+    device = os.getenv("WHISPER_DEVICE", "").strip().lower()
+    if not device:
+        device = "cpu"
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                device = "mps"
+        except (ImportError, AttributeError):
+            pass
     probe = await asyncio.create_subprocess_exec(
         "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(audio),
         stdout=asyncio.subprocess.PIPE,
     )
     stdout, _ = await probe.communicate()
-    duration = float(stdout.decode().strip() or 0)
+    try:
+        duration = float(stdout.decode().strip() or 0)
+    except ValueError as exc:
+        raise RuntimeError("FFmpeg đã trích âm thanh nhưng không đọc được thời lượng audio") from exc
+    if probe.returncode or duration <= 0:
+        raise RuntimeError(
+            "Không trích được âm thanh hợp lệ từ video. Hãy tải lại video hoặc bỏ video này khỏi lô."
+        )
     # Đoạn 60 giây là điểm cân bằng: đủ nhỏ để chạy song song nhưng không
     # lãng phí thời gian nạp model Whisper cho quá nhiều đoạn.
     chunk_seconds = max(30, int(os.getenv("WHISPER_CHUNK_SECONDS", "60")))
@@ -216,7 +263,7 @@ async def transcribe(video_path: Path, work_dir: Path, on_progress: Callable[[in
         chunk_dir.mkdir(parents=True, exist_ok=True)
         chunk_audio = chunk_dir / "chunk.wav"
         args = [
-            "whisper", str(chunk_audio), "--model", model, "--language", "Chinese", "--device", "cpu",
+            *_whisper_command(), str(chunk_audio), "--model", model, "--language", "Chinese", "--device", device,
             "--output_format", "srt", "--word_timestamps", "False", "--beam_size", "1", "--best_of", "1",
             "--output_dir", str(chunk_dir),
         ]
@@ -248,6 +295,18 @@ async def transcribe(video_path: Path, work_dir: Path, on_progress: Callable[[in
     return transcript
 
 
+def whisper_runtime_settings() -> dict[str, str | int]:
+    device = os.getenv("WHISPER_DEVICE", "").strip().lower()
+    if not device:
+        device = "auto"
+    return {
+        "model": os.getenv("WHISPER_MODEL", "small"),
+        "device": device,
+        "chunk_seconds": max(30, int(os.getenv("WHISPER_CHUNK_SECONDS", "60"))),
+        "parallelism": max(1, int(os.getenv("WHISPER_PARALLELISM", "3"))),
+    }
+
+
 def _atempo_chain(ratio: float) -> str:
     values: list[float] = []
     while ratio > 2:
@@ -272,13 +331,19 @@ def _natural_tts_target_ms(
     item: Subtitle,
     next_item: Subtitle | None,
     video_duration_ms: int,
-    max_breath_ms: int = 320,
+    max_breath_ms: int = 520,
 ) -> int:
     """Allow TTS to borrow a little following silence instead of sounding rushed."""
     original_ms = item.end_ms - item.start_ms
     boundary_ms = next_item.start_ms if next_item else video_duration_ms
     available_ms = max(original_ms, boundary_ms - item.start_ms)
     return min(available_ms, original_ms + max(0, max_breath_ms))
+
+
+def _strict_tts_target_ms(item: Subtitle, next_item: Subtitle | None) -> int:
+    """Keep one translated line inside the exact source subtitle boundary."""
+    boundary_ms = min(item.end_ms, next_item.start_ms) if next_item else item.end_ms
+    return max(1, boundary_ms - item.start_ms)
 
 
 def _edge_tts_options(prosody: tuple[str, str], attempt: int) -> dict[str, str]:
@@ -288,12 +353,22 @@ def _edge_tts_options(prosody: tuple[str, str], attempt: int) -> dict[str, str]:
     return {}
 
 
+def _dub_mux_args(video_path: Path, dubbed_audio_path: Path, output: Path) -> tuple[str, ...]:
+    """Replace the source audio so its original-language speech cannot leak through."""
+    return (
+        "ffmpeg", "-y", "-i", str(video_path), "-i", str(dubbed_audio_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-shortest", str(output),
+    )
+
+
 async def dub(
     video_path: Path,
     work_dir: Path,
     chinese_srt: str,
     voice: str,
     mood: str = "natural",
+    translation_style: str = "faithful",
     on_progress: Callable[[str, int, int], Awaitable[None]] | None = None,
 ) -> Path:
     check_tools()
@@ -306,14 +381,12 @@ async def dub(
     for internal_index, item in enumerate(subtitles, 1):
         item.index = internal_index
     (work_dir / "audio.srt").write_text(chinese_srt, "utf-8")
-    translated: list[str] = []
-    translation_prompt_version = "natural-dubbing-v2"
+    translation_prompt_version = "one-to-one-dubbing-v4"
     # Chia nhỏ để prompt không quá dài nhưng vẫn giữ ngữ cảnh theo từng nhóm câu.
     translation_batch_size = max(30, int(os.getenv("TRANSLATION_BATCH_SIZE", "60")))
     translation_batches = list(range(0, len(subtitles), translation_batch_size))
-    for batch_number, start in enumerate(translation_batches, 1):
-        if on_progress:
-            await on_progress("translate", batch_number - 1, len(translation_batches))
+
+    async def translate_batch(batch_number: int, start: int) -> tuple[int, list[str]]:
         source_lines = [item.text for item in subtitles[start:start + translation_batch_size]]
         source_durations_ms = [
             item.end_ms - item.start_ms
@@ -321,7 +394,7 @@ async def dub(
         ]
         batch_key = hashlib.sha256(
             json.dumps(
-                [translation_prompt_version, source_lines, source_durations_ms],
+                [translation_prompt_version, translation_style, source_lines, source_durations_ms],
                 ensure_ascii=False,
             ).encode("utf-8")
         ).hexdigest()
@@ -343,6 +416,7 @@ async def dub(
                 source_lines,
                 translation_status,
                 source_durations_ms,
+                translation_style,
             )
         invalid_indexes = [
             index for index, value in enumerate(cached)
@@ -363,7 +437,31 @@ async def dub(
                 # còn sót để một câu lỗi không làm dừng toàn bộ video.
                 cached[index] = _clean_vietnamese_tts_text(value)
         cache_path.write_text(json.dumps(cached, ensure_ascii=False), "utf-8")
-        translated.extend(cached)
+
+        return batch_number, cached
+
+    if on_progress:
+        await on_progress("translate", 0, len(translation_batches))
+    translated_batches: list[list[str] | None] = [None] * len(translation_batches)
+    translation_tasks = [
+        asyncio.create_task(translate_batch(batch_number, start))
+        for batch_number, start in enumerate(translation_batches)
+    ]
+    try:
+        completed_batches = 0
+        for task in asyncio.as_completed(translation_tasks):
+            batch_number, batch_result = await task
+            translated_batches[batch_number] = batch_result
+            completed_batches += 1
+            if on_progress:
+                await on_progress("translate", completed_batches, len(translation_batches))
+    except BaseException:
+        for task in translation_tasks:
+            task.cancel()
+        await asyncio.gather(*translation_tasks, return_exceptions=True)
+        raise
+
+    translated = [line for batch in translated_batches if batch is not None for line in batch]
     if on_progress:
         await on_progress("translate", len(translation_batches), len(translation_batches))
     vi_items = [Subtitle(item.index, item.start_ms, item.end_ms, text) for item, text in zip(subtitles, translated)]
@@ -379,19 +477,20 @@ async def dub(
         raise RuntimeError("Không đọc được thời lượng video")
     duration_ms = max(final_end, int(float(stdout.decode().strip()) * 1000))
     prosody = {
-        "natural": ("-8%", "+0Hz"),
-        "energetic": ("+3%", "+1Hz"),
-        "warm": ("-12%", "-1Hz"),
-    }.get(mood, ("-8%", "+0Hz"))
+        "natural": ("-5%", "+0Hz"),
+        "energetic": ("+2%", "+1Hz"),
+        "warm": ("-10%", "-1Hz"),
+    }.get(mood, ("-5%", "+0Hz"))
     max_tts_speedup = max(1.0, float(os.getenv("TTS_MAX_SPEEDUP", "1.12")))
-    timing_targets = {
-        item.index: _natural_tts_target_ms(
-            item,
-            vi_items[index + 1] if index + 1 < len(vi_items) else None,
-            duration_ms,
+    strict_one_to_one = translation_style == "faithful"
+    timing_targets = {}
+    for index, item in enumerate(vi_items):
+        next_item = vi_items[index + 1] if index + 1 < len(vi_items) else None
+        timing_targets[item.index] = (
+            _strict_tts_target_ms(item, next_item)
+            if strict_one_to_one
+            else _natural_tts_target_ms(item, next_item, duration_ms)
         )
-        for index, item in enumerate(vi_items)
-    }
 
     async def synthesize_segment(item: Subtitle) -> tuple[Subtitle, Path]:
         raw = work_dir / f"seg_{item.index:04}.mp3"
@@ -401,7 +500,7 @@ async def dub(
         cache_key_path = work_dir / f"seg_{item.index:04}.sha256"
         target_ms = timing_targets[item.index]
         cache_key = hashlib.sha256(
-            f"natural-v3\0{item.text}\0{voice}\0{mood}\0{target_ms}\0{max_tts_speedup}".encode("utf-8")
+            f"one-to-one-v4\0{translation_style}\0{item.text}\0{voice}\0{mood}\0{target_ms}\0{max_tts_speedup}".encode("utf-8")
         ).hexdigest()
         if (
             adjusted.exists() and adjusted.stat().st_size > 44
@@ -440,12 +539,23 @@ async def dub(
                     if not raw_temp.exists() or raw_temp.stat().st_size == 0:
                         raise RuntimeError("Edge-TTS tạo file rỗng")
                     raw_duration_ms = await _audio_duration_ms(raw_temp)
-                    ratio = _bounded_tts_ratio(raw_duration_ms, target_ms, max_tts_speedup)
+                    ratio = (
+                        max(1.0, raw_duration_ms / max(1, target_ms))
+                        if strict_one_to_one
+                        else _bounded_tts_ratio(raw_duration_ms, target_ms, max_tts_speedup)
+                    )
+                    audio_filter = _atempo_chain(ratio)
+                    if strict_one_to_one:
+                        target_seconds = target_ms / 1000
+                        audio_filter += (
+                            f",apad=pad_dur={target_seconds:.3f},"
+                            f"atrim=duration={target_seconds:.3f}"
+                        )
                     # Giải mã ngay trong vòng retry. File có header MP3 nhưng
                     # frame bị cụt cũng sẽ bị loại và TTS được gọi lại.
                     await _run(
                         "ffmpeg", "-y", "-i", str(raw_temp),
-                        "-filter:a", _atempo_chain(ratio),
+                        "-filter:a", audio_filter,
                         "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
                         str(adjusted_temp),
                     )
@@ -546,8 +656,8 @@ async def dub(
                 cursor_frames = start_frame
             with wave.open(str(adjusted), "rb") as segment_wav:
                 frames = segment_wav.readframes(segment_wav.getnframes())
-            # Không cắt đuôi câu nếu bản dịch vẫn dài hơn timestamp. Câu sau
-            # nối tiếp sau câu hiện tại; các khoảng nghỉ kế tiếp sẽ hấp thụ độ trễ.
+            # Chế độ 1-1 đã ép mỗi segment đúng timestamp nguồn. Các chế độ
+            # tự nhiên cũ vẫn có thể mượn một phần khoảng nghỉ kế tiếp.
             output_wav.writeframes(frames)
             cursor_frames += len(frames) // sample_width
         if total_frames > cursor_frames:
@@ -555,10 +665,7 @@ async def dub(
     if on_progress:
         await on_progress("mux", 0, 1)
     output = work_dir / "output_vi.mp4"
-    await _run(
-        "ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path), "-c:v", "copy",
-        "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-shortest", str(output),
-    )
+    await _run(*_dub_mux_args(video_path, audio_path, output))
     cleanup_media_intermediates(work_dir, output)
     if on_progress:
         await on_progress("mux", 1, 1)

@@ -9,6 +9,6 @@
     "loginMethod": "登录方式", "loginMethodPlaceholder": "选择登录方式",
     "cookies": "Cookie", "cookiesHint": "粘贴 Cookie 字符串", "cookiesPlaceholder": "在此粘贴 Cookie..."
   },
-  "button": { "initiateScan": "开始抓取视频", "initiating": "启动中...", "terminate": "停止", "stopping": "停止中..." },
+  "button": { "initiateScan": "开始抓取视频", "initiating": "启动中...", "terminate": "停止", "stopping": "停止中...", "collapseForm": "收起搜索表单", "expandForm": "打开搜索表单" },
   "warning": { "cookieSlider": "[提示] 小红书和抖音不建议使用 Cookie 登录，可能触发滑块验证" }
 }

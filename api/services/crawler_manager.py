@@ -20,6 +20,7 @@ import asyncio
 import subprocess
 import signal
 import os
+import shutil
 import sys
 from typing import Optional, List
 from datetime import datetime
@@ -37,6 +38,8 @@ class CrawlerManager:
         self.status = "idle"
         self.started_at: Optional[datetime] = None
         self.current_config: Optional[CrawlerStartRequest] = None
+        self._current_result_backup_dir: Optional[Path] = None
+        self._current_result_data_dir: Optional[Path] = None
         self._log_id = 0
         self._logs: List[LogEntry] = []
         self._read_task: Optional[asyncio.Task] = None
@@ -81,6 +84,68 @@ class CrawlerManager:
             except asyncio.QueueFull:
                 pass
 
+    def _platform_data_dir(self, platform: str) -> Path:
+        platform_dir = {
+            "dy": "douyin",
+            "bili": "bilibili",
+        }.get(platform, platform)
+        return self._workspace_root / "data" / platform_dir
+
+    def _search_result_files(self, data_dir: Path) -> list[Path]:
+        if not data_dir.exists():
+            return []
+        return [
+            result_file
+            for pattern in ("search_contents_*", "creator_contents_*")
+            for result_file in data_dir.rglob(pattern)
+            if result_file.is_file() and result_file.suffix in {".json", ".jsonl", ".csv", ".xlsx"}
+        ]
+
+    def _stash_search_results(self, data_dir: Path) -> Optional[Path]:
+        result_files = self._search_result_files(data_dir)
+        if not result_files:
+            return None
+
+        backup_dir = (
+            self._workspace_root
+            / ".crawl_backups"
+            / datetime.now().strftime("%Y%m%d%H%M%S%f")
+        )
+        for result_file in result_files:
+            relative_path = result_file.relative_to(data_dir)
+            backup_path = backup_dir / relative_path
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(result_file), str(backup_path))
+        return backup_dir
+
+    def _restore_search_results(self, data_dir: Path, backup_dir: Optional[Path]) -> bool:
+        if not backup_dir or not backup_dir.exists():
+            return False
+        restored = False
+        for backup_file in backup_dir.rglob("*"):
+            if not backup_file.is_file():
+                continue
+            relative_path = backup_file.relative_to(backup_dir)
+            target = data_dir / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.move(str(backup_file), str(target))
+                restored = True
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        return restored
+
+    def _discard_search_result_backup(self, backup_dir: Optional[Path]) -> None:
+        if backup_dir:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+    def _archive_search_result_backup(self, backup_dir: Optional[Path]) -> None:
+        """Keep prior crawl files out of the active list without deleting them."""
+        if not backup_dir or not backup_dir.exists():
+            return
+        archive_dir = self._workspace_root / ".crawl_history" / backup_dir.name
+        archive_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(backup_dir), str(archive_dir))
+
     def _parse_log_level(self, line: str) -> str:
         """Parse log level"""
         line_upper = line.upper()
@@ -114,17 +179,16 @@ class CrawlerManager:
                 except asyncio.QueueEmpty:
                     pass
 
-            # Mỗi lượt crawl là một tập kết quả độc lập. AsyncFileWriter ghi
-            # nối tiếp theo ngày, nên cần bỏ metadata tìm kiếm cũ trước khi chạy.
-            platform_dir = {
-                "dy": "douyin",
-                "bili": "bilibili",
-            }.get(config.platform.value, config.platform.value)
-            data_dir = self._workspace_root / "data" / platform_dir
-            if data_dir.exists():
-                for result_file in data_dir.rglob("search_contents_*"):
-                    if result_file.is_file() and result_file.suffix in {".json", ".jsonl", ".csv", ".xlsx"}:
-                        result_file.unlink()
+            # Các lượt search vẫn dùng tập kết quả riêng. Creator crawl bổ
+            # sung dần video vào thư viện hiện có để popup không trống trong
+            # lúc đợi các chi tiết mới.
+            data_dir = self._platform_data_dir(config.platform.value)
+            self._current_result_data_dir = data_dir
+            self._current_result_backup_dir = (
+                None
+                if config.crawler_type.value == "creator"
+                else self._stash_search_results(data_dir)
+            )
 
             # Build command line arguments
             cmd = self._build_command(config)
@@ -169,6 +233,17 @@ class CrawlerManager:
                 return True
             except Exception as e:
                 self.status = "error"
+                if self._restore_search_results(
+                    self._current_result_data_dir or data_dir,
+                    self._current_result_backup_dir,
+                ):
+                    restore_entry = self._create_log_entry(
+                        "Crawler could not start; restored previous video list",
+                        "warning",
+                    )
+                    await self._push_log(restore_entry)
+                self._current_result_backup_dir = None
+                self._current_result_data_dir = None
                 entry = self._create_log_entry(f"Failed to start crawler: {str(e)}", "error")
                 await self._push_log(entry)
                 return False
@@ -225,6 +300,17 @@ class CrawlerManager:
             "error_message": None
         }
 
+    def staged_creator_results(self, platform: str) -> Optional[Path]:
+        """Return the old snapshot temporarily hidden by a running creator crawl."""
+        if (
+            self.status == "running"
+            and self.current_config
+            and self.current_config.crawler_type.value == "creator"
+            and self.current_config.platform.value == platform
+        ):
+            return self._current_result_backup_dir
+        return None
+
     def _build_command(self, config: CrawlerStartRequest) -> list:
         """Build main.py command line arguments"""
         cmd = [sys.executable, str(self._project_root / "main.py")]
@@ -261,10 +347,15 @@ class CrawlerManager:
         if config.cookies:
             cmd.extend(["--cookies", config.cookies])
 
-        # Douyin chặn Chromium headless ở lần đăng nhập đầu. Khi chưa có phiên,
-        # mở Chromium ngoài vùng nhìn thấy để lấy QR về WebUI; sau đó luôn headless.
+        # Douyin đôi khi yêu cầu người dùng giải captcha trong lúc crawl creator.
+        # Creator crawl luôn mở Chromium để người dùng có thể thao tác captcha;
+        # các lượt khác vẫn dùng headless nếu đã có phiên đăng nhập.
         authenticated = (self._workspace_root / "browser_data" / "douyin_authenticated").exists()
-        headless = authenticated if config.platform.value == "dy" else config.headless
+        headless = (
+            authenticated and config.crawler_type.value != "creator"
+            if config.platform.value == "dy"
+            else config.headless
+        )
         cmd.extend(["--headless", "true" if headless else "false"])
 
         return cmd
@@ -301,6 +392,29 @@ class CrawlerManager:
             # Process ended
             if self.status == "running":
                 exit_code = self.process.returncode if self.process else -1
+                has_new_results = bool(
+                    self._current_result_data_dir
+                    and self._search_result_files(self._current_result_data_dir)
+                )
+                if has_new_results:
+                    # Keep prior files archived; do not put them back into the
+                    # active results directory after a successful new crawl.
+                    self._archive_search_result_backup(self._current_result_backup_dir)
+                else:
+                    restored = self._restore_search_results(
+                        self._current_result_data_dir or self._workspace_root / "data",
+                        self._current_result_backup_dir,
+                    )
+                    if restored:
+                        entry = self._create_log_entry(
+                            "Crawler did not create new search results; restored previous video list",
+                            "warning",
+                        )
+                        await self._push_log(entry)
+
+                self._current_result_backup_dir = None
+                self._current_result_data_dir = None
+
                 if exit_code == 0:
                     entry = self._create_log_entry("Crawler completed successfully", "success")
                 else:

@@ -10,14 +10,14 @@ cd /Users/lecongminh/code/job/auto-ai/MediaCrawler
 
 Mở **2 cửa sổ Terminal**.
 
-Terminal 1 — chạy backend (cổng `8080`):
+Terminal 1 — chạy backend (cổng `8081`):
 
 ```bash
 cd /Users/lecongminh/code/job/auto-ai/MediaCrawler
-uv run uvicorn api.main:app --port 8080
+uv run uvicorn api.main:app --host 127.0.0.1 --port 8081
 ```
 
-Terminal 2 — chạy frontend (cổng `5173`):
+Terminal 2 — chạy frontend (cổng `5173`, API proxy tới `8081`):
 
 ```bash
 cd /Users/lecongminh/code/job/auto-ai/MediaCrawler/webui
@@ -94,7 +94,26 @@ cp .env.example .env
 
 Điền `GEMINI_API_KEYS` trong `.env` nếu dùng tính năng Gemini. Không commit hoặc gửi file `.env` cho người khác.
 
-Whisper mặc định dùng model `small` để chạy ổn định trên Mac, chia audio 60 giây và chạy 3 đoạn song song. Có thể điều chỉnh trong `.env` bằng `WHISPER_CHUNK_SECONDS` và `WHISPER_PARALLELISM`; chia dưới 30 giây thường không nhanh hơn vì mỗi đoạn phải nạp model.
+Whisper mặc định dùng model `small` để chạy ổn định trên Mac, tự ưu tiên
+Apple MPS nếu có, chia audio 60 giây và chạy 3 đoạn song song. Có thể điều
+chỉnh trong `.env` bằng `WHISPER_MODEL`, `WHISPER_DEVICE`,
+`WHISPER_CHUNK_SECONDS` và `WHISPER_PARALLELISM`; chia dưới 30 giây thường
+không nhanh hơn vì mỗi đoạn phải nạp model.
+
+Preset nhanh cho máy Apple Silicon/RAM khá:
+
+```dotenv
+WHISPER_MODEL=base
+WHISPER_DEVICE=mps
+WHISPER_CHUNK_SECONDS=90
+WHISPER_PARALLELISM=2
+WHISPER_GLOBAL_PARALLELISM=2
+TTS_PARALLELISM=6
+TTS_GLOBAL_PARALLELISM=6
+```
+
+Nếu transcript sai nhiều, đổi `WHISPER_MODEL` lại `small`. Nếu máy nóng, RAM cao
+hoặc Edge-TTS hay retry/audio rỗng, giảm `TTS_PARALLELISM` về `4`.
 
 ## Chạy crawler bằng dòng lệnh (không dùng WebUI)
 
@@ -120,8 +139,15 @@ Dữ liệu mặc định được lưu trong thư mục `data/`; video tải v�
 2. Tích chọn **đúng một video**.
 3. Nhấn **Lồng tiếng Việt**.
 4. Đợi Whisper tạo transcript, sau đó đọc và sửa nội dung tiếng Trung trong ô SRT. Giữ nguyên số thứ tự và timestamp.
-5. Chọn giọng Hoài My hoặc Nam Minh, rồi nhấn **Transcript đúng — tiến hành lồng tiếng**.
+5. Chọn **Sát nghĩa 1–1** (mặc định) để mỗi câu nguồn tương ứng đúng một câu Việt,
+   không thêm/bớt ý và giữ đúng khung thời gian; sau đó chọn giọng Hoài My hoặc
+   Nam Minh rồi nhấn **Transcript đúng — tiến hành lồng tiếng**.
 6. Khi hoàn tất, nhấn **Tải output_vi.mp4**.
+
+Ở chế độ **Sát nghĩa 1–1**, câu đọc ngắn hơn timestamp sẽ được chèn khoảng lặng;
+câu dài hơn sẽ được co tốc độ để kết thúc trong timestamp gốc và không lấn sang
+câu tiếp theo. Các chế độ Đời thường/Thuyết minh/Review vẫn ưu tiên độ tự nhiên và
+có thể mượn một phần khoảng nghỉ kế tiếp.
 
 Hệ thống tự chia video dài thành chapter nội bộ để phân phối TTS song song:
 video 10–30 phút dùng chapter 5 phút và tối đa 4 tác vụ; video trên 30 phút

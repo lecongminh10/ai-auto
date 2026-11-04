@@ -104,7 +104,7 @@ USER_DATA_DIR = "%s_user_data_dir"  # %s will be replaced by platform name
 START_PAGE = 1
 
 # Control the number of crawled videos/posts
-CRAWLER_MAX_NOTES_COUNT = 15
+CRAWLER_MAX_NOTES_COUNT = 100
 
 # Only keep videos longer than this value while searching. Currently applied
 # to Douyin and Bilibili because their detail payloads expose video duration.

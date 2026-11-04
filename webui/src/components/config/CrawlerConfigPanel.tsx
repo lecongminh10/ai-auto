@@ -1,7 +1,7 @@
 import type { ComponentType, ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Globe, KeyRound, Play, Square } from 'lucide-react'
+import { ChevronDown, ChevronUp, Globe, KeyRound, Play, Square } from 'lucide-react'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
@@ -97,6 +97,7 @@ export function CrawlerConfigPanel() {
   const [isTranslating, setIsTranslating] = useState(false)
   const [translatedKeywords, setTranslatedKeywords] = useState('')
   const [douyinAuthenticated, setDouyinAuthenticated] = useState(false)
+  const [isFormCollapsed, setIsFormCollapsed] = useState(false)
 
   const isDisabled = status === 'running' || status === 'stopping'
   const isRunning = status === 'running'
@@ -120,6 +121,18 @@ export function CrawlerConfigPanel() {
   }
 
   const handleStart = async () => {
+    if (config.crawler_type === 'creator') {
+      if (!config.creator_ids.trim()) {
+        alert('Nhập link hoặc ID trang cá nhân của nhà sáng tạo')
+        return
+      }
+      startCrawler({ ...config, crawler_type: 'creator' })
+      return
+    }
+    if (!config.keywords.trim()) {
+      alert('Nhập từ khóa video cần tìm')
+      return
+    }
     setIsTranslating(true)
     try {
       let response: Response | undefined
@@ -162,8 +175,29 @@ export function CrawlerConfigPanel() {
 
   return (
     <div className="space-y-4 animate-slide-up">
+      <div className="flex justify-end">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => setIsFormCollapsed((collapsed) => !collapsed)}
+          aria-expanded={!isFormCollapsed}
+          aria-controls="crawler-search-form"
+        >
+          {isFormCollapsed ? (
+            <ChevronDown className="h-4 w-4" />
+          ) : (
+            <ChevronUp className="h-4 w-4" />
+          )}
+          {isFormCollapsed ? t('button.expandForm') : t('button.collapseForm')}
+        </Button>
+      </div>
+
       {/* Cấu hình tải video */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div
+        id="crawler-search-form"
+        className={isFormCollapsed ? 'hidden' : 'grid grid-cols-1 md:grid-cols-2 gap-4'}
+      >
         {/* Column 1: Target & Mode Section */}
         <Section
           title={t('section.targetMatrix.title')}
@@ -189,7 +223,32 @@ export function CrawlerConfigPanel() {
             </Select>
           </Field>
 
-          <Field label={t('field.keywords')} hint={t('field.keywordsHint')}>
+          <Field label="Cách lấy video">
+            <Select
+              value={config.crawler_type}
+              onValueChange={(value) => updateConfig({ crawler_type: value })}
+              disabled={isDisabled}
+            >
+              <SelectTrigger className="h-9 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="search">Tìm theo từ khóa</SelectItem>
+                <SelectItem value="creator">Tất cả video của một kênh</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+
+          {config.crawler_type === 'creator' ? (
+            <Field label="Link hoặc ID kênh" hint="Dán link trang cá nhân nhà sáng tạo; có thể nhập nhiều link/ID, cách nhau bằng dấu phẩy.">
+              <KeywordInput
+                placeholder="https://www.douyin.com/user/..."
+                value={config.creator_ids}
+                onChange={(creator_ids) => updateConfig({ creator_ids })}
+                disabled={isDisabled}
+              />
+            </Field>
+          ) : <Field label={t('field.keywords')} hint={t('field.keywordsHint')}>
             <KeywordInput
               placeholder={t('field.keywordsPlaceholder')}
               value={config.keywords}
@@ -204,7 +263,7 @@ export function CrawlerConfigPanel() {
                 Từ khóa gửi sang nền tảng: {translatedKeywords}
               </p>
             )}
-          </Field>
+          </Field>}
 
           <Field label="Video dài hơn (phút)" hint="Để 0 để hiện mọi video; chỉ tăng khi thật sự cần lọc video dài.">
             <Input
@@ -216,6 +275,21 @@ export function CrawlerConfigPanel() {
                 min_video_duration_seconds: Math.max(0, Number(event.target.value || 0) * 60),
               })}
               disabled={isDisabled || !['dy', 'bili'].includes(config.platform)}
+              className="h-9 text-xs"
+            />
+          </Field>
+
+          <Field label="Số video cần tìm" hint="Crawler sẽ duyệt tối đa số kết quả này cho mỗi từ khóa; video đã tải vẫn xuất hiện trong danh sách.">
+            <Input
+              type="number"
+              min="10"
+              max="10000"
+              step="10"
+              value={config.max_notes_count}
+              onChange={(event) => updateConfig({
+                max_notes_count: Math.min(10000, Math.max(10, Number(event.target.value || 100))),
+              })}
+              disabled={isDisabled}
               className="h-9 text-xs"
             />
           </Field>
@@ -284,7 +358,7 @@ export function CrawlerConfigPanel() {
         {isRunning ? (
           <Button
             onClick={handleStop}
-            disabled={isBusy || !config.keywords.trim()}
+            disabled={isBusy}
             className="w-full h-12 bg-cyber-neon-pink text-white font-mono font-bold text-sm tracking-wider hover:bg-cyber-neon-pink/90 hover:shadow-glow-pink-sm transition-all"
           >
             <Square className="w-4 h-4" />

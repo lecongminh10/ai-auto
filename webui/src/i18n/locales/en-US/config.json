@@ -9,6 +9,6 @@
     "loginMethod": "LOGIN METHOD", "loginMethodPlaceholder": "Select login method",
     "cookies": "COOKIES", "cookiesHint": "Paste cookie string", "cookiesPlaceholder": "Paste cookies here..."
   },
-  "button": { "initiateScan": "START VIDEO CRAWL", "initiating": "STARTING...", "terminate": "STOP", "stopping": "STOPPING..." },
+  "button": { "initiateScan": "START VIDEO CRAWL", "initiating": "STARTING...", "terminate": "STOP", "stopping": "STOPPING...", "collapseForm": "Collapse search form", "expandForm": "Open search form" },
   "warning": { "cookieSlider": "[Note] Cookie login is not recommended for Xiaohongshu and Douyin because it may trigger a slider captcha" }
 }

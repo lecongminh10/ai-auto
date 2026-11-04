@@ -9,6 +9,6 @@
     "loginMethod": "PHƯƠNG THỨC ĐĂNG NHẬP", "loginMethodPlaceholder": "Chọn phương thức đăng nhập",
     "cookies": "COOKIE", "cookiesHint": "Dán chuỗi Cookie", "cookiesPlaceholder": "Dán Cookie tại đây..."
   },
-  "button": { "initiateScan": "BẮT ĐẦU CRAWL VIDEO", "initiating": "ĐANG KHỞI ĐỘNG...", "terminate": "DỪNG", "stopping": "ĐANG DỪNG..." },
+  "button": { "initiateScan": "BẮT ĐẦU CRAWL VIDEO", "initiating": "ĐANG KHỞI ĐỘNG...", "terminate": "DỪNG", "stopping": "ĐANG DỪNG...", "collapseForm": "Thu gọn form tìm kiếm", "expandForm": "Mở form tìm kiếm" },
   "warning": { "cookieSlider": "[Lưu ý] Không nên đăng nhập Xiaohongshu và Douyin bằng Cookie vì có thể gặp captcha kéo thanh trượt" }
 }

@@ -41,7 +41,7 @@ from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
 from .exception import DataFetchError
-from .field import PublishTimeType
+from .field import PublishTimeType, SearchSortType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
 
@@ -146,6 +146,7 @@ class DouYinCrawler(AbstractCrawler):
                     posts_res = await self.dy_client.search_info_by_keyword(
                         keyword=keyword,
                         offset=page * dy_limit_count - dy_limit_count,
+                        sort_type=SearchSortType.LATEST,
                         publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
                         search_id=dy_search_id,
                     )
@@ -233,7 +234,7 @@ class DouYinCrawler(AbstractCrawler):
                 result = await self.dy_client.get_video_by_id(aweme_id)
                 # Sleep after fetching aweme detail
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[DouYinCrawler.get_aweme_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching aweme {aweme_id}")
+                utils.logger.debug(f"[DouYinCrawler.get_aweme_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching aweme {aweme_id}")
                 return result
             except DataFetchError as ex:
                 utils.logger.error(f"[DouYinCrawler.get_aweme_detail] Get aweme detail error: {ex}")
@@ -286,36 +287,89 @@ class DouYinCrawler(AbstractCrawler):
         utils.logger.info("[DouYinCrawler.get_creators_and_videos] Parsing creator URLs...")
 
         for creator_url in config.DY_CREATOR_ID_LIST:
-            try:
-                creator_info_parsed = parse_creator_info_from_url(creator_url)
-                user_id = creator_info_parsed.sec_user_id
-                utils.logger.info(f"[DouYinCrawler.get_creators_and_videos] Parsed sec_user_id: {user_id} from {creator_url}")
-            except ValueError as e:
-                utils.logger.error(f"[DouYinCrawler.get_creators_and_videos] Failed to parse creator URL: {e}")
-                continue
+            # From the video library, accept a video ID as a temporary way to
+            # resolve its author's sec_user_id. Do not persist or return that ID.
+            if creator_url.startswith("video:"):
+                aweme_id = creator_url.removeprefix("video:").strip()
+                try:
+                    aweme_detail = await self.dy_client.get_video_by_id(aweme_id)
+                    user_id = str((aweme_detail.get("author") or {}).get("sec_uid") or "")
+                    if not user_id:
+                        utils.logger.error(
+                            f"[DouYinCrawler.get_creators_and_videos] Could not resolve creator from video {aweme_id}"
+                        )
+                        continue
+                    utils.logger.info(
+                        f"[DouYinCrawler.get_creators_and_videos] Resolved creator from selected video {aweme_id}"
+                    )
+                except (DataFetchError, KeyError, AttributeError) as e:
+                    utils.logger.error(
+                        f"[DouYinCrawler.get_creators_and_videos] Failed to resolve creator from video {aweme_id}: {e}"
+                    )
+                    continue
+            else:
+                try:
+                    creator_url = creator_url.strip()
+                    try:
+                        creator_info_parsed = parse_creator_info_from_url(creator_url)
+                    except ValueError:
+                        # Douyin share links (v.douyin.com/...) redirect to
+                        # the canonical /user/{sec_uid} page.
+                        resolved_url = await self.dy_client.resolve_short_url(creator_url)
+                        if not resolved_url:
+                            raise
+                        creator_info_parsed = parse_creator_info_from_url(resolved_url)
+                    user_id = creator_info_parsed.sec_user_id
+                    utils.logger.info(f"[DouYinCrawler.get_creators_and_videos] Parsed sec_user_id from creator URL")
+                except ValueError as e:
+                    utils.logger.error(f"[DouYinCrawler.get_creators_and_videos] Failed to parse creator URL: {e}")
+                    continue
 
             creator_info: Dict = await self.dy_client.get_user_info(user_id)
             if creator_info:
                 await douyin_store.save_creator(user_id, creator=creator_info)
 
             # Get all video information of the creator
-            all_video_list = await self.dy_client.get_all_user_aweme_posts(sec_user_id=user_id, callback=self.fetch_creator_video_detail)
+            all_video_list = await self.dy_client.get_all_user_aweme_posts(
+                sec_user_id=user_id,
+                callback=self.fetch_creator_video_detail,
+                max_count=config.CRAWLER_MAX_NOTES_COUNT,
+            )
 
             video_ids = [video_item.get("aweme_id") for video_item in all_video_list]
             await self.batch_get_note_comments(video_ids)
 
     async def fetch_creator_video_detail(self, video_list: List[Dict]):
         """
-        Concurrently obtain the specified post list and save the data
+        Concurrently fetch creator posts and save each result as soon as it is
+        available. Creator listing only needs metadata and source URLs; media
+        files are downloaded later when the user selects videos.
         """
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [self.get_aweme_detail(post_item.get("aweme_id"), semaphore) for post_item in video_list]
 
-        note_details = await asyncio.gather(*task_list)
-        for aweme_item in note_details:
-            if aweme_item is not None:
+        async def fetch_and_save(post_item: Dict) -> str | None:
+            aweme_id = str(post_item.get("aweme_id") or "")
+            try:
+                aweme_item = await self.get_aweme_detail(aweme_id, semaphore)
+                if aweme_item is None:
+                    return None
                 await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
-                await self.get_aweme_media(aweme_item=aweme_item)
+                return aweme_id
+            except Exception as exc:
+                utils.logger.error(
+                    f"[DouYinCrawler.fetch_creator_video_detail] Could not save video {aweme_id}: {exc}"
+                )
+                return None
+
+        tasks = [asyncio.create_task(fetch_and_save(post_item)) for post_item in video_list]
+        total = len(tasks)
+        for completed, task in enumerate(asyncio.as_completed(tasks), 1):
+            aweme_id = await task
+            if aweme_id:
+                utils.logger.info(
+                    f"[DouYinCrawler.fetch_creator_video_detail] Saved creator video "
+                    f"{completed}/{total}: {aweme_id}"
+                )
 
     async def create_douyin_client(self, httpx_proxy: Optional[str]) -> DouYinClient:
         """Create douyin client"""
@@ -421,7 +475,7 @@ class DouYinCrawler(AbstractCrawler):
             aweme_item (Dict): 抖音作品详情
         """
         if not config.ENABLE_GET_MEIDAS:
-            utils.logger.info(f"[DouYinCrawler.get_aweme_media] Crawling image mode is not enabled")
+            utils.logger.debug("[DouYinCrawler.get_aweme_media] Crawling image mode is not enabled")
             return
         # List of note urls. If it is a short video type, an empty list will be returned.
         note_download_url: List[str] = douyin_store._extract_note_image_list(aweme_item)
